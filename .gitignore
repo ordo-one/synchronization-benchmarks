@@ -1,0 +1,28 @@
+# SPM
+.build/
+.swiftpm/
+Package.resolved.lock
+
+# macOS
+.DS_Store
+
+# Editors
+.vscode/
+.idea/
+
+# Private notes
+Internal/
+
+# Host-specific (private IPs / usernames)
+hosts.sh
+rsync.sh
+collect-results.sh
+run-remote.sh
+
+# Local-only CLI (not published)
+Sources/Mutex/
+CLI.md
+Package.internal.swift
+
+# Rust comparison build output
+comparison/rust/target/

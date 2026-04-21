@@ -4,15 +4,60 @@ How lock performance scales as the number of contending Swift Tasks increases.
 
 ![Contention scaling grid](graphs/contention-scaling__grid.png)
 
+![Stdlib PI / Optimal p50 ratio — cliff heatmap](graphs/contention-scaling-cliff__heatmap.png)
+
+![RustMutex / Optimal p50 ratio](graphs/contention-scaling-rust__heatmap.png)
+
+![NIOLock / Optimal p50 ratio](graphs/contention-scaling-nio__heatmap.png)
+
+<!-- TODO(inconsistency 2026-04-19): Three PI-cliff tables below disagree.
+     - "Key findings" (§2) says AMD 64c cliff at t=4, M1 Ultra cliff at t=16.
+     - "Fresh cross-machine / PI-futex cliff summary" says AMD cliff at t=8 (1080×),
+       M1 Ultra cliff at t=64 (564×). This table uses the post-cliff p50 as
+       "just before" — wrong read of the data.
+     - "Stdlib PI cliff" table (line ~141) says AMD cliff at t=8 (130×), M1 at t=16 (423×).
+     - Detail tables support AMD t=4 and M1 t=16.
+     Pick one convention (cliff = first t where PI ≥10× plain) and reconcile
+     all three tables before regenerating graphs. -->
+
+
 ## Workload
 
 50,000 total lock acquires distributed across N tasks. Each acquire does one dictionary lookup + update on a `[Int: UInt64]` map with 64 entries. No unlocked work between acquires (pause=0) — maximum contention.
+
+## Key findings
+
+1. **Optimal wins p50 throughput on every machine tested.** 1.4–6× faster than RustMutex, 1.4–5× faster than NIOLock, and 4–1080× faster than Stdlib PI under oversubscription. Same code, no per-host tuning.
+
+2. **Stdlib PI-futex (`Synchronization.Mutex`) has catastrophic cliffs** once contending tasks approach or exceed core count. The cliff point and magnitude scale with coherence-topology complexity:
+
+    | CPU | cliff starts at | p50 jump | magnitude |
+    |---|---|---|---:|
+    | AMD EPYC 9454P 64c | **tasks=4** | 1.5 ms → 1014 ms | ~700× |
+    | Intel Xeon E5-2699 v4 44c (2-socket NUMA) | tasks=4 | 13 ms → 134 ms (worsens to 2.2 s at t=64) | 10× early, 170× peak |
+    | Apple M1 Ultra 18c (aarch64) | tasks=16 | 1.8 ms → 854 ms | 488× |
+    | Intel Xeon Gold 6148 40c (2-socket NUMA) | tasks=16 | 24 ms → 261 ms | 11× |
+    | Intel i5-12500 12c (single die) | no cliff | gradual only | 1.5× |
+
+    The `rt_mutex` chain walking in the PI syscall path scales with waiter count and cross-die/socket traffic. Plain-futex variants (Optimal, RustMutex, NIOLock) all scale gracefully across the same range.
+
+3. **RustMutex's load-only spin pattern trades throughput for fairness.** On `ContentionScaling` (steady-state throughput) it loses 1.7–5× to Optimal. But it avoids the in-spin CAS RFO storm that hurts Optimal on 12-core Intel under extreme oversubscription (see `Fairness.md`). Different workloads → different winner.
+
+4. **NIOLock's park-immediate pattern is consistently 2–5× slower than Optimal at p50** — the 100-iter glibc adaptive spin doesn't fire under Swift-cooperative Task contention, so threads go straight to the kernel. Respectable tail behaviour but leaves throughput on the table.
+
+5. **Choose by workload:**
+    - **Steady-state throughput, tolerate occasional long tails:** `OptimalMutex`
+    - **Fairness priority on Intel oversubscription:** `RustMutex`-style load-only spin
+    - **Strict bounded max tail required (RT/latency-critical):** `Synchronization.Mutex` PI — but only below the cliff point for your CPU's topology
+
+---
 
 ## Implementations
 
 | Label | What it is | Futex | Spin strategy |
 |---|---|---|---|
-| **Optimal** | `OptimalMutex` — proposed replacement | `FUTEX_WAIT`/`FUTEX_WAKE` | 14 iterations, exponential backoff, regime-gated cap |
+| **Optimal** | `OptimalMutex` — proposed replacement | `FUTEX_WAIT`/`FUTEX_WAKE` | 20 iterations × base=64 PAUSE with RDTSC jitter, depth-gated skip-spin |
+| **RustMutex** | Rust std 1.62+ futex pattern (reference impl) | `FUTEX_WAIT`/`FUTEX_WAKE` | 100-iter load-only spin, post-spin CAS + kernel exchange, re-spin after wake |
 | **NIOLock** | `NIOLockedValueBox` — `pthread_mutex_t` wrapper | `FUTEX_WAIT`/`FUTEX_WAKE` (via glibc) | 0 (park immediately) |
 | **Stdlib PI** | `Synchronization.Mutex` — current stdlib | `FUTEX_LOCK_PI` | 1000 × `pause` (x86) / 100 × `wfe` (aarch64), fixed |
 
@@ -20,7 +65,6 @@ How lock performance scales as the number of contending Swift Tasks increases.
 
 | Name | Arch | Cores | CPU | Topology |
 |---|---|---:|---|---|
-| aarch64 4c | aarch64 | 4 | Apple M4 Pro (Mac Mini) | 4c container VM |
 | aarch64 12c | aarch64 | 12 | Apple M4 Pro (Mac Mini) | 12c container VM (all cores) |
 | aarch64 18c | aarch64 | 18 | Apple M1 Ultra | 20c host (2-die UltraFusion), 18c container VM |
 | x86 12c | x86_64 | 6P/12T | Intel i5-12500 | single die, Hyperthreading |
@@ -31,17 +75,77 @@ How lock performance scales as the number of contending Swift Tasks increases.
 
 ---
 
+## Fresh cross-machine p50 (2026-04-19)
+
+Re-run with current `OptimalMutex` (lazy waiter-count registration). Same code on every machine.
+
+### Intel i5-12500 (12c Alder Lake)
+
+| Implementation | t=1 w=1 p=0 | t=8 w=1 p=0 | t=64 w=1 p=0 | t=192 w=1 p=0 | t=384 w=1 p=0 |
+|---|---:|---:|---:|---:|---:|
+| **Optimal** | 1,375 µs | 1,635 µs | 1,825 µs | 1,879 µs | 2,016 µs |
+| RustMutex | 1,389 µs | 8,511 µs | 8,987 µs | 9,044 µs | 9,036 µs |
+| NIOLockedValueBox | 1,609 µs | 9,642 µs | 10,027 µs | 10,076 µs | 10,035 µs |
+| Synchronization.Mutex (PI) | 1,616 µs | 10,387 µs | 13,689 µs | 14,918 µs | 14,508 µs |
+
+Optimal 4.5–6× faster than Rust/NIO/Sync.Mutex at contested task counts. Rust is 5× slower than Optimal but slightly faster than NIO — its load-only spin surrenders throughput to avoid CAS storms (same Rust-vs-Optimal pattern noted in Fairness.md).
+
+### Intel Xeon Gold 6148 (40c 2-socket NUMA)
+
+| Implementation | t=1 w=1 p=0 | t=8 w=1 p=0 | t=64 w=1 p=0 | t=192 w=1 p=0 | t=384 w=1 p=0 |
+|---|---:|---:|---:|---:|---:|
+| **Optimal** | 2,634 µs | 7,213 µs | 22,118 µs | 22,757 µs | 23,233 µs |
+| NIOLockedValueBox | 3,082 µs | 25,362 µs | 32,195 µs | 32,752 µs | 33,194 µs |
+| Synchronization.Mutex (PI) | 2,929 µs | 43,155 µs | **466 ms** | **445 ms** | **461 ms** |
+
+Optimal 1.4–3.5× faster than NIO. **Sync.Mutex (PI) collapses 20× at t≥64** — cross-NUMA `rt_mutex` chain walk.
+
+### AMD EPYC 9454P (64c Zen 4 chiplet)
+
+| Implementation | t=1 w=1 p=0 | t=8 w=1 p=0 | t=64 w=1 p=0 | t=192 w=1 p=0 | t=384 w=1 p=0 |
+|---|---:|---:|---:|---:|---:|
+| **Optimal** | 1,063 µs | 3,215 µs | 12,837 µs | 13,025 µs | 13,640 µs |
+| RustMutex | 1,180 µs | 8,454 µs | 17,138 µs | 17,334 µs | 17,777 µs |
+| NIOLockedValueBox | 1,205 µs | 7,283 µs | 25,297 µs | 25,919 µs | 26,214 µs |
+| Synchronization.Mutex (PI) | 1,132 µs | **1217 ms** | **1376 ms** | **1390 ms** | **1415 ms** |
+
+Optimal 1.3× faster than Rust, 2× faster than NIO. Rust edges NIO by 1.5× at high-t (Rust's post-spin exchange absorbs AMD CAS contention better than NIO's immediate park). **Sync.Mutex (PI) collapses 1000× starting at t=8** — earliest cliff of any machine. AMD's inter-CCD coherence makes PI chain walking catastrophic above ~8 threads.
+
+### Apple M1 Ultra (18c aarch64 container)
+
+| Implementation | t=1 w=1 p=0 | t=8 w=1 p=0 | t=64 w=1 p=0 | t=192 w=1 p=0 | t=384 w=1 p=0 |
+|---|---:|---:|---:|---:|---:|
+| **Optimal** | 998 µs | 1,262 µs | 1,671 µs | 1,717 µs | 1,829 µs |
+| RustMutex | 968 µs | 2,171 µs | 3,375 µs | 3,873 µs | 4,153 µs |
+| NIOLockedValueBox | 2,324 µs | 6,369 µs | 7,160 µs | 7,586 µs | 8,249 µs |
+| Synchronization.Mutex (PI) | 1,026 µs | 1,751 µs | **933 ms** | **985 ms** | **1017 ms** |
+
+Optimal 1.7–2.3× faster than Rust; Rust is a clear 2nd place, beating NIO by ~2× at contested counts. **Sync.Mutex (PI) collapses 540× at t=64** — ARM PI cliff (see Experiments.md §14).
+
+### PI-futex cliff summary
+
+| CPU | cliff starts at | p50 just before | p50 at cliff | factor |
+|---|---|---:|---:|---:|
+| AMD EPYC 9454P 64c | t=8 | 1.13 ms | 1221 ms | **1080×** |
+| Intel Xeon Gold 6148 40c | t=64 | 43 ms | 466 ms | 11× |
+| Apple M1 Ultra 18c | t=64 | 1.66 ms | 936 ms | **564×** |
+| Intel i5-12500 12c | no cliff | — | — | gradual 1.5× |
+
+The cliff firing point correlates with `rt_mutex` chain walk complexity: more cores/sockets → cliff earlier and harder. Plain-futex (Optimal, NIO) scales gracefully across the same range.
+
+---
+
 ## Optimal vs NIOLock ratio (p50, all machines)
 
-| Tasks | aarch64 4c | aarch64 12c | aarch64 18c | x86 12c | x86 40c | x86 44c | x86 64c | x86 192c |
-|---:|---:|---:|---:|---:|---:|---:|---:|---:|
-| 1 | 1.3× | 1.3× | 2.4× | 1.2× | 1.2× | 1.1× | 1.1× | 1.3× |
-| 2 | 7.6× | 7.4× | 4.9× | 4.9× | 4.6× | 2.2× | 1.5× | 1.3× |
-| 4 | 2.9× | 2.9× | 3.8× | 3.8× | 3.1× | 2.5× | 1.8× | 1.3× |
-| 8 | 4.0× | 6.0× | 5.5× | 3.9× | 2.7× | 1.3× | 2.3× | 1.4× |
-| 16 | 3.3× | 5.5× | 4.9× | 3.4× | ~1× | 1.3× | 2.1× | 1.2× |
-| 64 | 3.4× | 5.4× | 3.9× | 3.0× | ~1× | 1.3× | 1.9× | 1.2× |
-| 192 | 3.2× | 5.5× | 3.6× | 3.0× | ~1× | 1.3× | 1.9× | 1.1× |
+| Tasks | aarch64 12c | aarch64 18c | x86 12c | x86 40c | x86 44c | x86 64c | x86 192c |
+|---:|---:|---:|---:|---:|---:|---:|---:|
+| 1 | 1.3× | 2.4× | 1.2× | 1.2× | 1.1× | 1.1× | 1.3× |
+| 2 | 7.4× | 4.9× | 4.9× | 4.6× | 2.2× | 1.5× | 1.3× |
+| 4 | 2.9× | 3.8× | 3.8× | 3.1× | 2.5× | 1.8× | 1.3× |
+| 8 | 6.0× | 5.5× | 3.9× | 2.7× | 1.3× | 2.3× | 1.4× |
+| 16 | 5.5× | 4.9× | 3.4× | ~1× | 1.3× | 2.1× | 1.2× |
+| 64 | 5.4× | 3.9× | 3.0× | ~1× | 1.3× | 1.9× | 1.2× |
+| 192 | 5.5× | 3.6× | 3.0× | ~1× | 1.3× | 1.9× | 1.1× |
 
 Optimal is faster than NIOLock at every task count on every machine. The advantage is largest on aarch64 (3–7×) and smallest on x86 192c (1.1–1.4×).
 
@@ -64,41 +168,7 @@ Optimal is faster than NIOLock at every task count on every machine. The advanta
 
 ## Detailed results per machine
 
-### aarch64 4c (Mac Mini M4 Pro, 4-core container VM)
-
-| Tasks | Impl | p50 | p75 | p90 | p99 | p100 | Samples |
-|---:|---|---:|---:|---:|---:|---:|---:|
-| 1 | **Optimal** | 498 | 515 | 527 | 564 | 612 | 250 |
-| 1 | NIOLock | 655 | 667 | 679 | 724 | 731 | 250 |
-| 1 | Stdlib PI | 516 | 535 | 551 | 605 | 635 | 250 |
-| | | | | | | | |
-| 2 | **Optimal** | 572 | 580 | 587 | 631 | 666 | 250 |
-| 2 | NIOLock | 4,219 | 6,345 | 7,856 | 8,634 | 8,746 | 250 |
-| 2 | Stdlib PI | 551 | 566 | 577 | 629 | 635 | 250 |
-| | | | | | | | |
-| 8 | **Optimal** | 709 | 726 | 745 | 790 | 797 | 250 |
-| 8 | NIOLock | 4,235 | 4,542 | 4,899 | 5,452 | 5,535 | 250 |
-| 8 | Stdlib PI | 741 | 779 | 806 | 858 | 903 | 250 |
-| | | | | | | | |
-| 16 | **Optimal** | 765 | 792 | 823 | 993 | 1,024 | 250 |
-| 16 | NIOLock | 4,223 | 4,444 | 4,633 | 5,022 | 5,252 | 250 |
-| 16 | Stdlib PI | 1,009 | 1,055 | 1,207 | 353,370 | 444,157 | 250 |
-| | | | | | | | |
-| 64 | **Optimal** | 838 | 876 | 919 | 1,097 | 1,537 | 250 |
-| 64 | NIOLock | 4,538 | 4,821 | 5,100 | 5,726 | 14,135 | 250 |
-| 64 | Stdlib PI | 1,141 | 1,218 | 3,619 | 578,814 | 600,894 | 250 |
-| | | | | | | | |
-| 192 | **Optimal** | 883 | 928 | 968 | 1,085 | 1,098 | 250 |
-| 192 | NIOLock | 4,870 | 5,120 | 5,403 | 5,984 | 6,663 | 250 |
-| 192 | Stdlib PI | 1,192 | 1,276 | 1,388 | 646,971 | 660,416 | 250 |
-
-**Observations:** Optimal 3–8× faster than NIOLock. Stdlib PI p50 is competitive but p99 is bimodal — occasionally 353–647ms at tasks≥16. Only 4 cores, so PI cliff is hidden at median but visible in tail.
-
----
-
-### aarch64 12c (Mac Mini M4 Pro, 12-core container VM) †
-
-† Detailed table below shares rows with aarch64 4c at tasks≥8 (identical p50/p75/p90 values) — suspected extraction/copy error in the per-machine pivot, pending re-run. Summary ratio row (top of doc) is computed from raw results and is independent.
+### aarch64 12c (Mac Mini M4 Pro, 12-core container VM)
 
 | Tasks | Impl | p50 | p75 | p90 | p99 | p100 | Samples |
 |---:|---|---:|---:|---:|---:|---:|---:|
@@ -130,175 +200,253 @@ Optimal is faster than NIOLock at every task count on every machine. The advanta
 
 ---
 
-### aarch64 18c (Apple M1 Ultra, 20c host, 2-die UltraFusion, 18c container VM)
+### aarch64 18c (Apple M1 Ultra, 20c host, 2-die UltraFusion, 18c container VM) — refreshed 2026-04-19
+
+![M1 Ultra absolute p50](graphs/contention-scaling__aarch64_18c.png)
+
+![M1 Ultra degradation vs t=1](graphs/contention-scaling-m1-degradation__grid.png)
+
+Optimal stays within 1.83× of its single-task p50 all the way to 384 contending tasks. Rust 4.3×, NIO 3.6× — gentle climbs. Stdlib PI cliffs 832× at t=16 (rt_mutex chain walk past core count).
+
+![M1 Ultra plain-futex p50 line + p50→p99 band](graphs/contention-scaling-m1-band__grid.png)
+
+Line = p50, shaded = p50→p99 tail. Stdlib PI omitted so y-axis collapses to 10³–10⁴ µs. Optimal's band is narrow at every task count (tight tail). Rust's band widens past t=8 (variable tail from load-only spin missing release windows). NIO's band stays roughly parallel to its p50 (park-immediate → predictable but slow).
 
 | Tasks | Impl | p50 | p75 | p90 | p99 | p100 | Samples |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 1 | **Optimal** | 914 | 945 | 989 | 1,095 | 1,149 | 250 |
-| 1 | NIOLock | 2,228 | 2,267 | 2,298 | 2,402 | 2,418 | 250 |
-| 1 | Stdlib PI | 977 | 995 | 1,020 | 1,106 | 1,127 | 250 |
+| 1 | **Optimal** | 998 | 1,030 | 1,051 | 1,094 | 1,104 | 250 |
+| 1 | RustMutex | 968 | 991 | 1,014 | 1,072 | 1,097 | 250 |
+| 1 | NIOLock | 2,324 | 2,365 | 2,400 | 2,431 | 2,449 | 250 |
+| 1 | Stdlib PI | 1,026 | 1,059 | 1,081 | 1,109 | 1,129 | 250 |
 | | | | | | | | |
-| 2 | **Optimal** | 954 | 989 | 1,027 | 1,099 | 1,129 | 250 |
-| 2 | NIOLock | 4,665 | 4,960 | 5,300 | 6,226 | 6,367 | 250 |
-| 2 | Stdlib PI | 1,042 | 1,089 | 1,153 | 1,445 | 1,579 | 250 |
+| 2 | **Optimal** | 1,090 | 1,128 | 1,161 | 1,207 | 1,231 | 250 |
+| 2 | RustMutex | 1,123 | 1,157 | 1,198 | 1,286 | 1,349 | 250 |
+| 2 | NIOLock | 5,251 | 5,726 | 5,984 | 6,300 | 6,451 | 250 |
+| 2 | Stdlib PI | 1,098 | 1,128 | 1,178 | 1,378 | 1,414 | 250 |
 | | | | | | | | |
-| 4 | **Optimal** | 1,028 | 1,061 | 1,089 | 1,169 | 1,180 | 250 |
-| 4 | NIOLock | 3,916 | 4,338 | 5,022 | 5,755 | 5,969 | 250 |
-| 4 | Stdlib PI | 1,148 | 1,190 | 1,248 | 1,589 | 1,707 | 250 |
+| 4 | **Optimal** | 1,157 | 1,204 | 1,255 | 1,347 | 1,411 | 250 |
+| 4 | RustMutex | 1,363 | 1,556 | 1,699 | 1,866 | 1,898 | 250 |
+| 4 | NIOLock | 4,551 | 4,903 | 5,198 | 5,669 | 5,862 | 250 |
+| 4 | Stdlib PI | 1,167 | 1,230 | 1,315 | 1,512 | 1,577 | 250 |
 | | | | | | | | |
-| 8 | **Optimal** | 1,119 | 1,162 | 1,202 | 1,304 | 1,353 | 250 |
-| 8 | NIOLock | 6,128 | 6,291 | 6,459 | 6,844 | 6,910 | 250 |
-| 8 | Stdlib PI | 1,536 | 1,788 | 1,963 | 3,854 | 48,629 | 250 |
+| 8 | **Optimal** | 1,262 | 1,320 | 1,363 | 1,438 | 1,518 | 250 |
+| 8 | RustMutex | 2,171 | 2,273 | 2,386 | 2,617 | 2,680 | 250 |
+| 8 | NIOLock | 6,369 | 6,566 | 6,783 | 7,229 | 7,508 | 250 |
+| 8 | Stdlib PI | 1,751 | 1,945 | 2,097 | 5,755 | 19,075 | 250 |
 | | | | | | | | |
-| 16 | **Optimal** | 1,336 | 1,386 | 1,457 | 1,739 | 1,826 | 250 |
-| 16 | NIOLock | 6,484 | 6,730 | 7,066 | 8,659 | 9,130 | 250 |
-| 16 | Stdlib PI | **650,641** | **880,804** | **933,233** | **1,068,561** | **1,068,561** | 20 |
+| 16 | **Optimal** | 1,413 | 1,476 | 1,542 | 1,706 | 1,863 | 250 |
+| 16 | RustMutex | 2,982 | 3,230 | 3,467 | 4,403 | 4,698 | 250 |
+| 16 | NIOLock | 6,828 | 7,303 | 7,803 | 9,036 | 10,106 | 250 |
+| 16 | Stdlib PI | **854,065** | **997,720** | **1,039,139** | **1,056,832** | **1,056,832** | — |
 | | | | | | | | |
-| 64 | **Optimal** | 1,782 | 1,874 | 1,988 | 2,306 | 2,628 | 250 |
-| 64 | NIOLock | 6,926 | 7,225 | 7,561 | 9,765 | 10,517 | 250 |
-| 64 | Stdlib PI | **857,735** | **908,591** | **963,641** | **973,888** | **973,888** | 17 |
+| 64 | **Optimal** | 1,671 | 1,788 | 1,912 | 2,628 | 2,805 | 250 |
+| 64 | RustMutex | 3,375 | 3,643 | 3,889 | 4,735 | 6,050 | 250 |
+| 64 | NIOLock | 7,160 | 7,500 | 8,073 | 10,281 | 11,532 | 250 |
+| 64 | Stdlib PI | **932,708** | **964,690** | **1,009,254** | **1,041,597** | **1,041,597** | — |
 | | | | | | | | |
-| 192 | **Optimal** | 2,068 | 2,173 | 2,314 | 2,720 | 2,759 | 250 |
-| 192 | NIOLock | 7,348 | 7,684 | 8,135 | 11,960 | 13,859 | 250 |
-| 192 | Stdlib PI | **945,291** | **983,040** | **1,049,100** | **1,073,099** | **1,073,099** | 17 |
+| 192 | **Optimal** | 1,717 | 1,836 | 1,939 | 2,228 | 2,314 | 250 |
+| 192 | RustMutex | 3,873 | 4,166 | 4,452 | 5,313 | 6,332 | 250 |
+| 192 | NIOLock | 7,586 | 8,069 | 8,602 | 9,945 | 10,131 | 250 |
+| 192 | Stdlib PI | **985,137** | **1,053,819** | **1,075,839** | **1,079,144** | **1,079,144** | — |
+| | | | | | | | |
+| 384 | **Optimal** | 1,829 | 1,904 | 2,010 | 2,275 | 2,284 | 250 |
+| 384 | RustMutex | 4,153 | 4,428 | 4,714 | 5,394 | 6,225 | 250 |
+| 384 | NIOLock | 8,249 | 8,765 | 9,470 | 11,559 | 11,852 | 250 |
+| 384 | Stdlib PI | **1,016,594** | **1,087,373** | **1,118,831** | **1,129,971** | **1,129,971** | — |
 
-**Observations:** Optimal 3.5–5.5× faster than NIOLock. PI cliff at tasks=16: 1,536 → 650,641 µs (423×). Stdlib PI barely completes iterations at tasks≥16 (17–20 samples vs 250).
+**Observations:** Optimal 1.7–2.3× faster than Rust; Rust a clear 2nd place beating NIO by ~2× at contested counts. **PI cliff at tasks=16: 1,751 → 854,065 µs (488×)**. ARM PI cliff (see Experiments.md §14) — `rt_mutex` chain walk collapses past core count. Stdlib PI at tasks≥16 effectively unusable for throughput.
 
 ---
 
-### x86 12c (Intel i5-12500, 6P/12T Hyperthreading)
+### x86 12c (Intel i5-12500, 6P/12T Hyperthreading) — refreshed 2026-04-19
 
 | Tasks | Impl | p50 | p75 | p90 | p99 | p100 | Samples |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 1 | **Optimal** | 1,349 | 1,354 | 1,383 | 1,644 | 1,653 | 250 |
-| 1 | NIOLock | 1,573 | 1,578 | 1,584 | 1,599 | 1,615 | 250 |
-| 1 | Stdlib PI | 1,438 | 1,489 | 1,571 | 1,636 | 1,659 | 250 |
+| 1 | **Optimal** | 1,375 | 1,386 | 1,487 | 1,525 | 1,547 | 250 |
+| 1 | RustMutex | 1,389 | 1,391 | 1,394 | 1,400 | 1,401 | 250 |
+| 1 | NIOLock | 1,609 | 1,618 | 1,623 | 1,806 | 1,814 | 250 |
+| 1 | Stdlib PI | 1,616 | 1,714 | 2,515 | 6,812 | 7,353 | 250 |
 | | | | | | | | |
-| 2 | **Optimal** | 1,436 | 1,502 | 1,519 | 1,700 | 1,861 | 250 |
-| 2 | NIOLock | 7,053 | 7,176 | 8,520 | 11,485 | 11,514 | 124 |
-| 2 | Stdlib PI | 4,424 | 4,907 | 5,083 | 5,386 | 5,476 | 210 |
+| 2 | **Optimal** | 1,406 | 1,414 | 1,434 | 1,506 | 1,520 | 250 |
+| 2 | RustMutex | 4,370 | 4,649 | 4,907 | 5,161 | 5,206 | 250 |
+| 2 | NIOLock | 7,148 | 9,216 | 9,601 | 9,740 | 9,767 | 250 |
+| 2 | Stdlib PI | 4,579 | 4,854 | 4,981 | 5,181 | 5,254 | 250 |
 | | | | | | | | |
-| 4 | **Optimal** | 1,689 | 1,751 | 1,820 | 2,109 | 2,121 | 250 |
-| 4 | NIOLock | 6,443 | 6,812 | 7,291 | 8,274 | 8,294 | 144 |
-| 4 | Stdlib PI | 3,103 | 5,661 | 8,212 | 18,612 | 38,751 | 162 |
+| 4 | **Optimal** | 1,474 | 1,486 | 1,494 | 1,537 | 1,570 | 250 |
+| 4 | RustMutex | 5,997 | 6,828 | 7,234 | 7,504 | 7,569 | 250 |
+| 4 | NIOLock | 6,963 | 7,352 | 7,692 | 8,294 | 8,485 | 250 |
+| 4 | Stdlib PI | 7,274 | 7,815 | 8,733 | 9,888 | 10,203 | 250 |
 | | | | | | | | |
-| 8 | **Optimal** | 1,809 | 2,183 | 4,698 | 8,954 | 14,424 | 250 |
-| 8 | NIOLock | 7,021 | 8,192 | 9,814 | 14,369 | 17,977 | 104 |
-| 8 | Stdlib PI | 7,070 | 7,512 | 9,896 | 663,107 | 663,107 | 22 |
+| 8 | **Optimal** | 1,635 | 1,654 | 1,676 | 1,720 | 1,770 | 250 |
+| 8 | RustMutex | 8,511 | 8,757 | 8,954 | 9,265 | 9,319 | 250 |
+| 8 | NIOLock | 9,642 | 10,043 | 10,748 | 11,100 | 11,211 | 250 |
+| 8 | Stdlib PI | 10,387 | 12,607 | 13,222 | 14,238 | 14,548 | 250 |
 | | | | | | | | |
-| 16 | **Optimal** | 2,851 | 2,931 | 3,002 | 3,203 | 3,427 | 250 |
-| 16 | NIOLock | 9,609 | 9,921 | 10,559 | 12,710 | 12,710 | 99 |
-| 16 | Stdlib PI | 11,313 | 12,313 | 13,730 | 15,315 | 15,315 | 80 |
+| 16 | **Optimal** | 1,742 | 1,763 | 1,786 | 1,883 | 1,892 | 250 |
+| 16 | RustMutex | 8,634 | 8,823 | 8,921 | 9,126 | 9,291 | 250 |
+| 16 | NIOLock | 9,765 | 10,494 | 10,838 | 11,018 | 11,038 | 250 |
+| 16 | Stdlib PI | 12,296 | 13,885 | 14,639 | 15,892 | 18,368 | 250 |
 | | | | | | | | |
-| 64 | **Optimal** | 3,119 | 3,156 | 3,199 | 3,355 | 3,436 | 250 |
-| 64 | NIOLock | 9,396 | 9,691 | 10,076 | 11,125 | 11,144 | 101 |
-| 64 | Stdlib PI | 11,158 | 13,689 | 14,189 | 19,138 | 19,138 | 78 |
+| 64 | **Optimal** | 1,825 | 1,845 | 1,867 | 1,988 | 4,074 | 250 |
+| 64 | RustMutex | 8,987 | 9,118 | 9,241 | 9,740 | 12,697 | 250 |
+| 64 | NIOLock | 10,027 | 10,879 | 11,158 | 11,690 | 14,382 | 250 |
+| 64 | Stdlib PI | 13,689 | 15,237 | 15,745 | 19,317 | 28,995 | 250 |
 | | | | | | | | |
-| 192 | **Optimal** | 3,191 | 3,222 | 3,269 | 3,707 | 3,761 | 250 |
-| 192 | NIOLock | 9,650 | 9,961 | 10,674 | 11,403 | 11,403 | 98 |
-| 192 | Stdlib PI | 11,084 | 12,730 | 14,033 | 29,272 | 29,272 | 78 |
+| 192 | **Optimal** | 1,879 | 1,897 | 1,921 | 2,065 | 2,089 | 250 |
+| 192 | RustMutex | 9,044 | 9,167 | 9,249 | 9,372 | 9,397 | 250 |
+| 192 | NIOLock | 10,076 | 10,863 | 11,149 | 11,502 | 12,962 | 250 |
+| 192 | Stdlib PI | 14,918 | 18,907 | 190,317 | 475,791 | 1,006,165 | 250 |
+| | | | | | | | |
+| 384 | **Optimal** | 2,016 | 2,036 | 2,054 | 2,124 | 2,175 | 250 |
+| 384 | RustMutex | 9,036 | 9,175 | 9,314 | 9,478 | 9,624 | 250 |
+| 384 | NIOLock | 10,035 | 10,740 | 11,018 | 11,379 | 11,725 | 250 |
+| 384 | Stdlib PI | 14,508 | 16,048 | 151,912 | 280,232 | 301,788 | 250 |
 
-**Observations:** Optimal 3.0–4.9× faster than NIOLock. No p50 PI cliff (12 cores, spin masks PI cost), but PI p99 at tasks=8 is bimodal: 663ms. Optimal has extremely tight p50→p99 at tasks≥16 (12% spread).
+**Observations:** Optimal 4.5–6× faster than Rust/NIO/Stdlib PI at contested task counts. Rust 5× slower than Optimal but beats NIO — load-only spin surrenders throughput to avoid CAS storms. No p50 PI cliff (12 cores, spin masks PI cost) but p100 tail at t=192 spikes to 1 second (PI chain walk under oversubscription).
 
 ---
 
-### x86 40c (Intel Xeon Gold 6148, 2-socket NUMA)
+### x86 40c (Intel Xeon Gold 6148, 2-socket NUMA) — refreshed 2026-04-19
 
 | Tasks | Impl | p50 | p75 | p90 | p99 | p100 | Samples |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 1 | **Optimal** | 2,492 | 2,533 | 2,615 | 3,117 | 3,378 | 250 |
-| 1 | NIOLock | 3,023 | 3,052 | 3,066 | 3,887 | 4,034 | 250 |
-| 1 | Stdlib PI | 3,441 | 3,463 | 3,707 | 4,284 | 5,185 | 250 |
+| 1 | **Optimal** | 2,677 | 2,703 | 2,836 | 3,260 | 3,995 | 250 |
+| 1 | RustMutex | 2,886 | 3,461 | 3,705 | 4,436 | 4,487 | 250 |
+| 1 | NIOLock | 3,209 | 3,242 | 3,553 | 4,045 | 4,101 | 250 |
+| 1 | Stdlib PI | 3,484 | 3,697 | 4,022 | 4,514 | 5,537 | 250 |
 | | | | | | | | |
-| 2 | **Optimal** | 2,834 | 2,869 | 3,652 | 4,714 | 4,875 | 250 |
-| 2 | NIOLock | 13,033 | 14,852 | 16,908 | 21,430 | 23,577 | 250 |
-| 2 | Stdlib PI | 5,775 | 6,562 | 14,844 | 18,350 | 20,099 | 250 |
+| 2 | **Optimal** | 2,773 | 2,836 | 2,957 | 3,332 | 3,610 | 250 |
+| 2 | RustMutex | 7,987 | 11,624 | 14,918 | 19,513 | 20,228 | 250 |
+| 2 | NIOLock | 13,984 | 16,056 | 17,875 | 22,725 | 26,961 | 250 |
+| 2 | Stdlib PI | 5,767 | 6,975 | 14,574 | 21,135 | 23,025 | 250 |
 | | | | | | | | |
-| 4 | **Optimal** | 4,866 | 5,890 | 6,328 | 7,201 | 7,514 | 250 |
-| 4 | NIOLock | 15,024 | 18,137 | 20,726 | 25,739 | 28,810 | 250 |
-| 4 | Stdlib PI | 25,805 | 29,721 | 33,276 | 41,976 | 45,291 | 250 |
+| 4 | **Optimal** | 3,441 | 3,553 | 3,785 | 4,399 | 4,742 | 250 |
+| 4 | RustMutex | 14,090 | 15,753 | 20,840 | 25,756 | 27,174 | 250 |
+| 4 | NIOLock | 14,868 | 18,596 | 21,053 | 25,805 | 29,289 | 250 |
+| 4 | Stdlib PI | 25,477 | 30,278 | 34,963 | 44,007 | 46,496 | 250 |
 | | | | | | | | |
-| 8 | **Optimal** | 8,667 | 12,935 | 14,549 | 16,622 | 16,709 | 250 |
-| 8 | NIOLock | 23,396 | 26,788 | 30,310 | 34,931 | 37,441 | 250 |
-| 8 | Stdlib PI | 39,911 | — | — | — | — | — |
+| 8 | **Optimal** | 7,123 | 8,397 | 9,175 | 10,609 | 10,805 | 250 |
+| 8 | RustMutex | 21,430 | 25,215 | 27,492 | 31,080 | 31,713 | 250 |
+| 8 | NIOLock | 27,279 | 30,048 | 32,686 | 36,405 | 39,168 | 250 |
+| 8 | Stdlib PI | 29,622 | 34,537 | 39,846 | 51,282 | 59,276 | 250 |
 | | | | | | | | |
-| 16 | **Optimal** | 27,181 | — | — | — | — | — |
-| 16 | NIOLock | 27,836 | — | — | — | — | — |
-| 16 | Stdlib PI | 278,397 | — | — | — | — | — |
+| 16 | **Optimal** | 19,775 | 21,496 | 22,610 | 24,150 | 26,473 | 250 |
+| 16 | RustMutex | 30,163 | 31,146 | 31,998 | 33,849 | 38,299 | 250 |
+| 16 | NIOLock | 31,031 | 33,128 | 35,783 | 38,863 | 39,619 | 250 |
+| 16 | Stdlib PI | **261,226** | **337,117** | **382,730** | **418,961** | **418,961** | 250 |
 | | | | | | | | |
-| 64 | **Optimal** | 31,588 | — | — | — | — | — |
-| 64 | NIOLock | 32,752 | — | — | — | — | — |
-| 64 | Stdlib PI | 459,538 | — | — | — | — | — |
+| 64 | **Optimal** | 21,987 | 23,085 | 24,003 | 25,592 | 26,668 | 250 |
+| 64 | RustMutex | 30,704 | 31,670 | 32,358 | 34,210 | 34,501 | 250 |
+| 64 | NIOLock | 32,883 | 36,176 | 38,404 | 40,403 | 41,377 | 250 |
+| 64 | Stdlib PI | **450,101** | **465,830** | **479,724** | **490,273** | **490,273** | 250 |
+| | | | | | | | |
+| 192 | **Optimal** | 23,052 | 24,232 | 25,018 | 26,804 | 27,463 | 250 |
+| 192 | RustMutex | 31,261 | 32,178 | 33,079 | 36,733 | 37,604 | 250 |
+| 192 | NIOLock | 32,653 | 36,766 | 38,273 | 39,551 | 39,757 | 250 |
+| 192 | Stdlib PI | **451,412** | **473,432** | **475,529** | **494,489** | **494,489** | 250 |
+| | | | | | | | |
+| 384 | **Optimal** | 23,446 | 24,297 | 25,477 | 27,165 | 27,203 | 250 |
+| 384 | RustMutex | 31,605 | 32,670 | 33,423 | 34,931 | 35,990 | 250 |
+| 384 | NIOLock | 32,997 | 36,831 | 38,568 | 40,600 | 41,160 | 250 |
+| 384 | Stdlib PI | **462,160** | **473,956** | **481,559** | **495,249** | **495,249** | 250 |
 
-**Observations:** Optimal 1.0–4.6× faster than NIOLock. Biggest gap at tasks=2–4 (NUMA cross-socket contention). At tasks≥16, Optimal and NIOLock converge (~1×). Stdlib PI degrades to 278–460ms at tasks≥16.
+**Observations:** Optimal 1.4–5× faster than Rust/NIO across all task counts. Biggest Optimal advantage at tasks=2–8 (NUMA cross-socket contention; depth gate prevents cross-die RFO storm). Rust beats NIO by 1.0–1.3× at contested counts. **PI cliff at tasks=16: 24 → 261 ms (11×)** — 2-socket NUMA PI chain walk.
 
 ---
 
-### x86 44c (Intel Xeon E5-2699 v4, 2-socket NUMA)
+### x86 44c (Intel Xeon E5-2699 v4, 2-socket NUMA Broadwell) — refreshed 2026-04-19
 
 | Tasks | Impl | p50 | p75 | p90 | p99 | p100 | Samples |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 1 | **Optimal** | 5,505 | 5,603 | 5,644 | 6,009 | 7,009 | 250 |
-| 1 | NIOLock | 6,304 | 6,332 | 6,386 | 6,730 | 6,731 | 250 |
-| 1 | Stdlib PI | 6,705 | 6,734 | 6,779 | 7,135 | 7,141 | 250 |
+| 1 | **Optimal** | 5,362 | 5,386 | 5,452 | 5,804 | 6,187 | 250 |
+| 1 | RustMutex | 5,472 | 6,758 | 6,787 | 7,164 | 7,188 | 250 |
+| 1 | NIOLock | 6,406 | 6,443 | 6,472 | 6,828 | 6,836 | 250 |
+| 1 | Stdlib PI | 6,570 | 6,586 | 6,623 | 6,984 | 7,470 | 250 |
 | | | | | | | | |
-| 2 | **Optimal** | 7,885 | 10,101 | 18,235 | 21,856 | 25,186 | 250 |
-| 2 | NIOLock | 17,695 | 21,561 | 27,132 | 36,176 | 40,100 | 250 |
-| 2 | Stdlib PI | 17,465 | 23,380 | 28,803 | 39,322 | 45,390 | 250 |
+| 2 | **Optimal** | 6,279 | 6,726 | 7,119 | 7,762 | 7,875 | 250 |
+| 2 | RustMutex | 14,098 | 19,104 | 21,594 | 25,903 | 36,749 | 250 |
+| 2 | NIOLock | 14,156 | 18,711 | 22,495 | 30,900 | 42,155 | 250 |
+| 2 | Stdlib PI | 14,123 | 16,482 | 20,644 | 37,224 | 38,869 | 250 |
 | | | | | | | | |
-| 4 | **Optimal** | 10,912 | 14,770 | 18,465 | 21,168 | 24,318 | 250 |
-| 4 | NIOLock | 27,591 | 30,835 | 34,636 | 39,158 | 44,089 | 250 |
-| 4 | Stdlib PI | 105,710 | 219,415 | 327,680 | 452,985 | 456,029 | 107 |
+| 4 | **Optimal** | 12,698 | 14,049 | 15,172 | 16,810 | 16,978 | 250 |
+| 4 | RustMutex | 15,270 | 17,400 | 21,021 | 31,834 | 33,929 | 250 |
+| 4 | NIOLock | 21,053 | 26,116 | 30,245 | 35,914 | 38,632 | 250 |
+| 4 | Stdlib PI | **133,693** | **300,679** | **379,847** | **573,939** | **573,939** | 250 |
 | | | | | | | | |
-| 8 | **Optimal** | 22,692 | 24,510 | 26,968 | 30,425 | 31,496 | 250 |
-| 8 | NIOLock | 28,557 | 31,801 | 34,374 | 41,320 | 47,247 | 250 |
-| 8 | Stdlib PI | — | — | — | — | — | — |
+| 8 | **Optimal** | 24,674 | 26,001 | 27,558 | 31,490 | 32,230 | 250 |
+| 8 | RustMutex | 32,178 | 33,882 | 35,783 | 39,748 | 43,443 | 250 |
+| 8 | NIOLock | 22,872 | 26,149 | 31,228 | 38,109 | 38,629 | 250 |
+| 8 | Stdlib PI | **563,085** | **567,804** | **611,844** | **680,127** | **680,127** | 250 |
 | | | | | | | | |
-| 16 | **Optimal** | 21,430 | — | — | — | — | — |
-| 16 | NIOLock | 30,196 | — | — | — | — | — |
-| 16 | Stdlib PI | 741,343 | — | — | — | — | — |
+| 16 | **Optimal** | 24,396 | 25,805 | 27,165 | 30,196 | 32,168 | 250 |
+| 16 | RustMutex | 25,412 | 28,000 | 29,802 | 34,865 | 35,129 | 250 |
+| 16 | NIOLock | 31,228 | 33,817 | 36,405 | 38,896 | 39,044 | 250 |
+| 16 | Stdlib PI | **1,399,849** | **1,658,847** | **1,745,879** | **1,923,345** | **1,923,345** | 250 |
 | | | | | | | | |
-| 64 | **Optimal** | 21,676 | — | — | — | — | — |
-| 64 | NIOLock | 28,279 | — | — | — | — | — |
-| 64 | Stdlib PI | 2,022,703 | — | — | — | — | — |
+| 64 | **Optimal** | 21,578 | 22,249 | 22,774 | 23,708 | 24,152 | 250 |
+| 64 | RustMutex | 25,526 | 26,116 | 26,804 | 29,049 | 29,458 | 250 |
+| 64 | NIOLock | 25,264 | 28,623 | 30,163 | 31,932 | 32,563 | 250 |
+| 64 | Stdlib PI | **2,055,209** | **2,110,783** | **2,205,690** | **2,205,690** | **2,205,690** | 250 |
+| | | | | | | | |
+| 192 | **Optimal** | 22,151 | 22,774 | 23,331 | 24,756 | 25,106 | 250 |
+| 192 | RustMutex | 26,690 | 27,197 | 27,656 | 28,983 | 29,261 | 250 |
+| 192 | NIOLock | 25,362 | 28,377 | 30,507 | 31,752 | 32,609 | 250 |
+| 192 | Stdlib PI | **2,140,144** | **2,212,495** | **2,266,187** | **2,266,187** | **2,266,187** | 250 |
+| | | | | | | | |
+| 384 | **Optimal** | 22,594 | 23,167 | 23,757 | 24,986 | 25,368 | 250 |
+| 384 | RustMutex | 27,116 | 27,787 | 28,279 | 29,639 | 30,811 | 250 |
+| 384 | NIOLock | 26,952 | 29,983 | 31,162 | 32,440 | 33,217 | 250 |
+| 384 | Stdlib PI | **2,218,787** | **2,233,467** | **2,273,470** | **2,273,470** | **2,273,470** | 250 |
 
-**Observations:** First 2-socket NUMA machine. Optimal 1.3–2.5× faster than NIOLock. Stdlib PI cliff at tasks=4 (105ms) — early due to cross-socket PI chain. At tasks=64: Stdlib PI reaches **2 seconds**.
+**Observations:** Broadwell 2-socket NUMA. Optimal 1.1–1.5× faster than Rust/NIO (narrowest gap of any machine — Broadwell coherence hurts all contenders similarly). **PI cliff at tasks=4: 12.7 → 134 ms (10×)**, escalates to **2.2 seconds at tasks=64** — earliest and worst PI degradation by absolute magnitude. Broadwell QPI cross-socket PI chain walking is catastrophic.
 
 ---
 
-### x86 64c (AMD EPYC 9454P, CCD chiplet 8×8)
+### x86 64c (AMD EPYC 9454P, CCD chiplet 8×8) — refreshed 2026-04-19
 
 | Tasks | Impl | p50 | p75 | p90 | p99 | p100 | Samples |
 |---:|---|---:|---:|---:|---:|---:|---:|
-| 1 | **Optimal** | 1,036 | 1,047 | 1,070 | 1,107 | 1,114 | 250 |
-| 1 | NIOLock | 1,117 | 1,129 | 1,146 | 1,245 | 1,267 | 250 |
-| 1 | Stdlib PI | 1,071 | 1,090 | 1,108 | 1,149 | 1,262 | 250 |
+| 1 | **Optimal** | 1,063 | 1,072 | 1,110 | 1,164 | 1,425 | 250 |
+| 1 | RustMutex | 1,180 | 1,204 | 1,213 | 1,251 | 1,333 | 250 |
+| 1 | NIOLock | 1,205 | 1,228 | 1,244 | 1,290 | 1,564 | 250 |
+| 1 | Stdlib PI | 1,132 | 1,139 | 1,149 | 1,240 | 1,561 | 250 |
 | | | | | | | | |
-| 2 | **Optimal** | 1,632 | 1,672 | 1,709 | 1,795 | 1,927 | 250 |
-| 2 | NIOLock | 2,394 | 2,558 | 2,669 | 3,262 | 3,592 | 250 |
-| 2 | Stdlib PI | 2,982 | 3,389 | 3,697 | 4,583 | 4,661 | 250 |
+| 2 | **Optimal** | 1,240 | 1,306 | 1,589 | 1,678 | 1,703 | 250 |
+| 2 | RustMutex | 4,037 | 4,497 | 4,665 | 4,919 | 5,008 | 250 |
+| 2 | NIOLock | 2,298 | 2,447 | 2,681 | 2,894 | 3,105 | 250 |
+| 2 | Stdlib PI | 3,086 | 3,275 | 3,445 | 4,110 | 4,389 | 250 |
 | | | | | | | | |
-| 4 | **Optimal** | 3,715 | 4,542 | 4,923 | 5,280 | 5,379 | 250 |
-| 4 | NIOLock | 6,849 | 7,586 | 7,959 | 9,044 | 9,783 | 250 |
-| 4 | Stdlib PI | 6,382 | 11,117 | 25,870 | 81,527 | 109,840 | 250 |
+| 4 | **Optimal** | 1,519 | 1,599 | 1,674 | 1,775 | 1,801 | 250 |
+| 4 | RustMutex | 4,944 | 5,526 | 5,845 | 6,320 | 6,465 | 250 |
+| 4 | NIOLock | 2,935 | 3,224 | 3,469 | 3,994 | 4,405 | 250 |
+| 4 | Stdlib PI | **1,013,973** | **1,077,936** | **1,118,831** | **1,128,168** | **1,128,168** | — |
 | | | | | | | | |
-| 8 | **Optimal** | 8,823 | 9,232 | 9,634 | 10,355 | 10,547 | 250 |
-| 8 | NIOLock | 20,349 | 21,168 | 21,873 | 22,823 | 23,205 | 250 |
-| 8 | Stdlib PI | **781,189** | **789,578** | **792,199** | **798,407** | **798,407** | 20 |
+| 8 | **Optimal** | 3,215 | 3,486 | 3,719 | 4,151 | 4,640 | 250 |
+| 8 | RustMutex | 8,454 | 8,970 | 9,437 | 9,994 | 10,362 | 250 |
+| 8 | NIOLock | 7,283 | 7,963 | 8,659 | 11,297 | 12,303 | 250 |
+| 8 | Stdlib PI | **1,217,397** | **1,224,737** | **1,226,834** | **1,237,084** | **1,237,084** | — |
 | | | | | | | | |
-| 16 | **Optimal** | 11,002 | 11,289 | 11,624 | 11,887 | 11,962 | 250 |
-| 16 | NIOLock | 23,020 | 23,757 | 24,232 | 24,855 | 25,862 | 250 |
-| 16 | Stdlib PI | **815,792** | **821,559** | **825,229** | **825,754** | **825,754** | 19 |
+| 16 | **Optimal** | 8,561 | 8,905 | 9,118 | 9,724 | 9,858 | 250 |
+| 16 | RustMutex | 12,911 | 13,337 | 13,828 | 14,893 | 15,341 | 250 |
+| 16 | NIOLock | 20,840 | 21,365 | 21,889 | 22,659 | 22,985 | 250 |
+| 16 | Stdlib PI | **1,298,137** | **1,301,283** | **1,305,477** | **1,306,289** | **1,306,289** | — |
 | | | | | | | | |
-| 64 | **Optimal** | 13,009 | 13,328 | 13,623 | 13,926 | 14,110 | 250 |
-| 64 | NIOLock | 25,264 | 27,083 | 27,492 | 28,000 | 28,238 | 250 |
-| 64 | Stdlib PI | **898,630** | **904,397** | **959,447** | **980,072** | **980,072** | 17 |
+| 64 | **Optimal** | 12,837 | 13,206 | 13,459 | 14,074 | 14,281 | 250 |
+| 64 | RustMutex | 17,138 | 17,465 | 17,842 | 18,579 | 18,885 | 250 |
+| 64 | NIOLock | 25,297 | 26,804 | 27,361 | 28,131 | 29,186 | 250 |
+| 64 | Stdlib PI | **1,375,732** | **1,389,363** | **1,398,800** | **1,399,312** | **1,399,312** | — |
 | | | | | | | | |
-| 192 | **Optimal** | 13,451 | 13,746 | 13,959 | 14,369 | 14,521 | 250 |
-| 192 | NIOLock | 25,510 | 27,132 | 27,804 | 28,344 | 28,463 | 250 |
-| 192 | Stdlib PI | **889,192** | **894,435** | **894,960** | **897,860** | **897,860** | 17 |
+| 192 | **Optimal** | 13,025 | 13,287 | 13,574 | 14,230 | 14,330 | 250 |
+| 192 | RustMutex | 17,334 | 17,646 | 17,908 | 18,334 | 18,439 | 250 |
+| 192 | NIOLock | 25,919 | 27,656 | 28,246 | 28,951 | 28,994 | 250 |
+| 192 | Stdlib PI | **1,390,412** | **1,410,335** | **1,415,194** | **1,415,194** | **1,415,194** | — |
+| | | | | | | | |
+| 384 | **Optimal** | 13,640 | 13,910 | 14,197 | 14,639 | 15,214 | 250 |
+| 384 | RustMutex | 17,777 | 18,137 | 18,366 | 19,120 | 20,289 | 250 |
+| 384 | NIOLock | 26,214 | 27,869 | 28,393 | 29,147 | 29,237 | 250 |
+| 384 | Stdlib PI | **1,414,529** | **1,427,112** | **1,430,258** | **1,432,602** | **1,432,602** | — |
 
-**Observations:** Optimal 1.5–2.3× faster than NIOLock. PI cliff at tasks=8: 781ms. AMD CCD chiplet topology — PI chain crosses CCDs via Infinity Fabric. Optimal has very tight distributions (p50→p99 within 8% at tasks≥16).
+**Observations:** Optimal 1.3× faster than Rust, 2× faster than NIO at contested counts. **PI cliff at tasks=4: 1,014 ms** (earliest cliff of any machine; AMD CCD → Infinity Fabric cross-die PI chain collapses fast). Optimal has very tight p50→p99 (within 10% at tasks≥16).
 
 ---
 

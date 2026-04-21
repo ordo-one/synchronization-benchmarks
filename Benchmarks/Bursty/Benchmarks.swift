@@ -3,8 +3,6 @@ import Foundation
 import Histogram
 import MutexBench
 
-let maxDurationSecs = Int(ProcessInfo.processInfo.environment["MUTEX_BENCH_MAX_SECS"] ?? "") ?? 30
-
 // Bursty arrivals — thundering-herd probe.
 //
 // Pattern: all N tasks wait on a shared deadline, then simultaneously try to
@@ -17,8 +15,6 @@ let maxDurationSecs = Int(ProcessInfo.processInfo.environment["MUTEX_BENCH_MAX_S
 //     "exp_backoff + (jitter & (exp_backoff - 1))" — targets this exact shape.
 //   WebKit WTF::Lock unfairness detection under bursty load:
 //     https://webkit.org/blog/6161/locking-in-webkit/
-//
-// Reports merged HDR histogram per burst (first-acquire-of-burst latency).
 
 struct BurstConfig: Sendable {
     let burstSize: Int
@@ -72,138 +68,43 @@ func burstyWorkload(
     }
 }
 
-let runSlow = ProcessInfo.processInfo.environment["MUTEX_BENCH_SLOW"] == "1"
-let runCopy = ProcessInfo.processInfo.environment["MUTEX_BENCH_COPY"] == "1"
-
 let benchmarks: @Sendable () -> Void = {
     // Entire target gated — results converged within 0.3% on 12C test host.
-    // Keep gated but enable on high-core machines to test bursty contention
-    // at scale. Set MUTEX_BENCH_SLOW=1 to include.
-    guard runSlow else { return }
+    // Set MUTEX_BENCH_SLOW=1 to include.
+    guard BenchEnv.slow else { return }
 
-    Benchmark.defaultConfiguration = .init(
-        metrics: [.wallClock, .cpuUser, .cpuSystem, .throughput, .syscalls, .contextSwitches, .threadsRunning, .instructions],
-        timeUnits: .microseconds,
+    BenchEnv.applyDefaultConfig(
         warmupIterations: 3,
-        maxDuration: .seconds(maxDurationSecs),
+        maxDurationSecs: BenchEnv.maxSecs(default: 30),
         maxIterations: 10
     )
 
+    var variants = StandardVariants.defaultsWithRust()
+    #if os(Linux)
+    // Bursty had pthread_adaptive_np unconditional (not gated by runSlow) in original.
+    // Keep unconditional here.
+    if !variants.contains(where: { $0.name == "pthread_adaptive_np" }) {
+        variants.append(.pthreadAdaptive())
+    }
+    #endif
+
     for cfg in burstConfigs {
-        Benchmark("\(cfg.label) Synchronization.Mutex") { benchmark in
-            let box = SyncMutexBox(capacity: defaultMapCapacity)
-            benchmark.startMeasurement()
-            let hists = await burstyWorkload(
-                burstSize: cfg.burstSize,
-                bursts: cfg.bursts,
-                opsPerBurst: cfg.opsPerBurst,
-                quietMs: cfg.quietMs
-            ) { box.work(1) }
-            benchmark.stopMeasurement()
-            let merged = mergeHistograms(hists)
-            printLatencySummary("\(cfg.label) Synchronization.Mutex first-of-burst", merged)
-        }
-
-        Benchmark("\(cfg.label) NIOLockedValueBox") { benchmark in
-            let box = NIOLockBox(capacity: defaultMapCapacity)
-            benchmark.startMeasurement()
-            let hists = await burstyWorkload(
-                burstSize: cfg.burstSize,
-                bursts: cfg.bursts,
-                opsPerBurst: cfg.opsPerBurst,
-                quietMs: cfg.quietMs
-            ) { box.work(1) }
-            benchmark.stopMeasurement()
-            let merged = mergeHistograms(hists)
-            printLatencySummary("\(cfg.label) NIOLockedValueBox first-of-burst", merged)
-        }
-
-        #if os(Linux)
-        if runCopy {
-            Benchmark("\(cfg.label) Synchronization.Mutex (copy)") { benchmark in
-                let m = SynchronizationMutex(MapState(capacity: defaultMapCapacity))
+        for v in variants {
+            Benchmark("\(cfg.label) \(v.name)") { benchmark in
+                let h = v.make(defaultMapCapacity)
                 benchmark.startMeasurement()
                 let hists = await burstyWorkload(
                     burstSize: cfg.burstSize,
                     bursts: cfg.bursts,
                     opsPerBurst: cfg.opsPerBurst,
                     quietMs: cfg.quietMs
-                ) { m.withLock { $0.update(iterations: 1) } }
+                ) {
+                    h.runLocked { $0.update(iterations: 1) }
+                }
                 benchmark.stopMeasurement()
                 let merged = mergeHistograms(hists)
-                printLatencySummary("\(cfg.label) Synchronization.Mutex (copy) first-of-burst", merged)
+                printLatencySummary("\(cfg.label) \(v.name) first-of-burst", merged)
             }
         }
-
-        Benchmark("\(cfg.label) PlainFutexMutex (spin=100)") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: defaultMapCapacity), spinTries: 100)
-            benchmark.startMeasurement()
-            let hists = await burstyWorkload(
-                burstSize: cfg.burstSize,
-                bursts: cfg.bursts,
-                opsPerBurst: cfg.opsPerBurst,
-                quietMs: cfg.quietMs
-            ) { m.withLock { $0.update(iterations: 1) } }
-            benchmark.stopMeasurement()
-            let merged = mergeHistograms(hists)
-            printLatencySummary("\(cfg.label) PlainFutexMutex (spin=100) first-of-burst", merged)
-        }
-
-        Benchmark("\(cfg.label) plain spin=14 backoff") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: defaultMapCapacity), spinTries: 14, useBackoff: true)
-            benchmark.startMeasurement()
-            let hists = await burstyWorkload(
-                burstSize: cfg.burstSize,
-                bursts: cfg.bursts,
-                opsPerBurst: cfg.opsPerBurst,
-                quietMs: cfg.quietMs
-            ) { m.withLock { $0.update(iterations: 1) } }
-            benchmark.stopMeasurement()
-            let merged = mergeHistograms(hists)
-            printLatencySummary("\(cfg.label) plain spin=14 backoff first-of-burst", merged)
-        }
-
-        Benchmark("\(cfg.label) plain spin=40 fixed") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: defaultMapCapacity), spinTries: 40)
-            benchmark.startMeasurement()
-            let hists = await burstyWorkload(
-                burstSize: cfg.burstSize,
-                bursts: cfg.bursts,
-                opsPerBurst: cfg.opsPerBurst,
-                quietMs: cfg.quietMs
-            ) { m.withLock { $0.update(iterations: 1) } }
-            benchmark.stopMeasurement()
-            let merged = mergeHistograms(hists)
-            printLatencySummary("\(cfg.label) plain spin=40 fixed first-of-burst", merged)
-        }
-
-        Benchmark("\(cfg.label) Optimal") { benchmark in
-            let m = OptimalMutex(MapState(capacity: defaultMapCapacity))
-            benchmark.startMeasurement()
-            let hists = await burstyWorkload(
-                burstSize: cfg.burstSize,
-                bursts: cfg.bursts,
-                opsPerBurst: cfg.opsPerBurst,
-                quietMs: cfg.quietMs
-            ) { m.withLock { $0.update(iterations: 1) } }
-            benchmark.stopMeasurement()
-            let merged = mergeHistograms(hists)
-            printLatencySummary("\(cfg.label) Optimal first-of-burst", merged)
-        }
-
-        Benchmark("\(cfg.label) pthread_adaptive_np") { benchmark in
-            let m = AdaptiveMutex(MapState(capacity: defaultMapCapacity))
-            benchmark.startMeasurement()
-            let hists = await burstyWorkload(
-                burstSize: cfg.burstSize,
-                bursts: cfg.bursts,
-                opsPerBurst: cfg.opsPerBurst,
-                quietMs: cfg.quietMs
-            ) { m.withLock { $0.update(iterations: 1) } }
-            benchmark.stopMeasurement()
-            let merged = mergeHistograms(hists)
-            printLatencySummary("\(cfg.label) pthread_adaptive_np first-of-burst", merged)
-        }
-        #endif
     }
 }

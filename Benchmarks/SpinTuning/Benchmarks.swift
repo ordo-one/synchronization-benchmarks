@@ -1,268 +1,277 @@
 import Benchmark
-import Foundation
 import MutexBench
 #if os(Linux)
 import CFutexShims
 #endif
 
-let maxDurationSecs = Int(ProcessInfo.processInfo.environment["MUTEX_BENCH_MAX_SECS"] ?? "") ?? 15
+// Default suite: Optimal + RustMutex + NIO + a small set of best variations.
+// Set MUTEX_BENCH_EXPERIMENT=1 to enable the full exploration matrix
+// (budget sweeps, adaptive/two-stage/epoch/hint variants, historical reference).
 
-// Sweep spin strategies at fixed high-contention points.
-//
-// Previous results:
-//   - Backoff essential on 12-core (fixed spin regresses)
-//   - cap=32 too coarse for long hold times
-//   - PI no-spin: 10× worse than plain futex park (PI syscall is the cost)
-//
-// This round: test backoff cap=8 (new default, Rust-style) vs cap=32 (old).
+// RustMutex tuning grid — two axes to match pthread park cost (10-30µs wake):
+//   A. More iterations × 1 PAUSE (more loads, same ~35ns spacing)
+//   B. Same iterations × more PAUSE (same load count, wider spacing)
+#if os(Linux)
+let rustTuningGrid: [MutexVariant] = [
+    // A1/A2: more iterations × 1 PAUSE.
+    .rustMutex(name: "RustMutex sp=500 × 1",  spinTries: 500,  pausesPerIter: 1),
+    .rustMutex(name: "RustMutex sp=1000 × 1", spinTries: 1000, pausesPerIter: 1),
+    // B1/B2: same iterations × more PAUSE.
+    .rustMutex(name: "RustMutex sp=100 × 16", spinTries: 100, pausesPerIter: 16),
+    .rustMutex(name: "RustMutex sp=100 × 32", spinTries: 100, pausesPerIter: 32),
+    // C: middle ground.
+    .rustMutex(name: "RustMutex sp=40 × 32",  spinTries: 40,  pausesPerIter: 32),
+    // Retry axis — hybrid between Rust load-only and Optimal in-spin CAS.
+    .rustMutex(name: "RustMutex sp=100 × 1 retry=5",   spinTries: 100, pausesPerIter: 1,  outerRetries: 5),
+    .rustMutex(name: "RustMutex sp=100 × 1 retry=20",  spinTries: 100, pausesPerIter: 1,  outerRetries: 20),
+    .rustMutex(name: "RustMutex sp=100 × 16 retry=20", spinTries: 100, pausesPerIter: 16, outerRetries: 20),
+    // Bounded-retrier experiment.
+    // NOTE: `retrierLimit=1, spinIfLimited=true` was removed — livelocks at
+    // tasks≥8. With only 1 retrier slot, remaining 7+ threads spin forever
+    // in load-only mode instead of parking, bench never completes.
+    // `limit=1 park` (spinIfLimited=false) is fine — excess threads park.
+    // `limit≥2 spin` is fine — enough retrier slots to avoid the live-lock.
+    .rustMutex(name: "RustMutex sp=100 × 8 retry=5 limit=1 park", spinTries: 100, pausesPerIter: 8, outerRetries: 5, retrierLimit: 1, spinIfLimited: false),
+    .rustMutex(name: "RustMutex sp=100 × 8 retry=5 limit=2 spin", spinTries: 100, pausesPerIter: 8, outerRetries: 5, retrierLimit: 2, spinIfLimited: true),
+    .rustMutex(name: "RustMutex sp=100 × 8 retry=5 limit=4 spin", spinTries: 100, pausesPerIter: 8, outerRetries: 5, retrierLimit: 4, spinIfLimited: true),
+    // Depth-adaptive gate grafted onto Rust-style spin.
+    .rustMutex(name: "RustMutex gate=4",                      depthThreshold: 4),
+    .rustMutex(name: "RustMutex sp=100 × 16 gate=4",          spinTries: 100, pausesPerIter: 16, depthThreshold: 4),
+    .rustMutex(name: "RustMutex sp=100 × 16 retry=20 gate=4", spinTries: 100, pausesPerIter: 16, outerRetries: 20, depthThreshold: 4),
+]
+
+// Stuck-at-2 fix variants hang reproducibly on SpinTuning tasks=2/16 across
+// AMD Zen 4 64c, Skylake 40c NUMA, Broadwell 44c NUMA, and Apple M1 Ultra.
+// Gated behind MUTEX_BENCH_RUST_DEMOTE=1.
+let rustDemoteVariants: [MutexVariant] = [
+    .rustMutex(name: "RustMutex demote", demoteOnEmpty: true),
+    .rustMutex(name: "RustMutex demote+skipWake", skipSpuriousWake: true, demoteOnEmpty: true),
+    .rustMutex(name: "RustMutex sp=100 × 16 demote+skipWake",
+               spinTries: 100, pausesPerIter: 16,
+               skipSpuriousWake: true, demoteOnEmpty: true),
+]
+
+// INSTR DepthAdaptive sweep for t∈[8,16]. K=4 variant.
+let stInstrDepthSweep: [MutexVariant] = [
+    .depthAdaptive(
+        name: "INSTR depth K=4 sp=20 no-starv pcl=64",
+        spinTries: 20, pauseBase: 64, depthThreshold: 4,
+        useStarvation: false, postCASLostPause: 64, instrument: true
+    ),
+    .depthAdaptive(
+        name: "INSTR depth K=4 sp=20 no-starv pcl=128",
+        spinTries: 20, pauseBase: 64, depthThreshold: 4,
+        useStarvation: false, postCASLostPause: 128, instrument: true
+    ),
+    .depthAdaptive(
+        name: "INSTR depth K=4 sp=20 base=64 no-starv",
+        spinTries: 20, pauseBase: 64, depthThreshold: 4,
+        useStarvation: false, instrument: true
+    ),
+    .depthAdaptive(
+        name: "INSTR depth K=4 sp=20 no-starv pws=32",
+        spinTries: 20, pauseBase: 64, depthThreshold: 4,
+        useStarvation: false, postWakeSpinTries: 32, instrument: true
+    ),
+    .depthAdaptive(
+        name: "INSTR depth K=4 sp=20 no-starv pws=32 dcheck",
+        spinTries: 20, pauseBase: 64, depthThreshold: 4,
+        useStarvation: false, postWakeSpinTries: 32,
+        preWaitDoubleCheck: true, instrument: true
+    ),
+    .depthAdaptive(
+        name: "INSTR depth K=4 sp=20 base=64 starv=1ms",
+        spinTries: 20, pauseBase: 64, depthThreshold: 4,
+        useStarvation: true, starvationThresholdNs: 1_000_000, instrument: true
+    ),
+    .depthAdaptive(
+        name: "INSTR depth K=4 sp=20 base=64 starv=1ms pws=32",
+        spinTries: 20, pauseBase: 64, depthThreshold: 4,
+        useStarvation: true, starvationThresholdNs: 1_000_000,
+        postWakeSpinTries: 32, instrument: true
+    ),
+    .depthAdaptive(
+        name: "INSTR depth K=4 sp=5 base=64 starv=1ms pws=32",
+        spinTries: 5, pauseBase: 64, depthThreshold: 4,
+        useStarvation: true, starvationThresholdNs: 1_000_000,
+        postWakeSpinTries: 32, instrument: true
+    ),
+]
+
+// Best variations retained in default suite.
+let stBestVariations: [MutexVariant] = [
+    .plainFutex(name: "best: sp=40 hwjitter base=128",
+                spinTries: 40, earlyExitOnWaiters: true,
+                backoffCap: 128, useHWJitter: true),
+    .plainFutex(name: "best: sp=20 hwjitter base=128",
+                spinTries: 20, earlyExitOnWaiters: true,
+                backoffCap: 128, useHWJitter: true),
+    .adaptiveSpin(name: "best: adaptive cap=100 base=128", maxCap: 100, pauseBase: 128),
+]
+#endif
 
 let benchmarks: @Sendable () -> Void = {
-    Benchmark.defaultConfiguration = .init(
-        metrics: [.wallClock, .cpuUser, .cpuSystem, .throughput, .syscalls, .contextSwitches, .threadsRunning, .instructions],
-        timeUnits: .microseconds,
-        warmupIterations: 25,
-        maxDuration: .seconds(maxDurationSecs),
-        maxIterations: 250
+    BenchEnv.applyDefaultConfig(
+        warmupIterations: BenchEnv.focus ? 5 : 25,
+        maxDurationSecs: BenchEnv.maxSecs(default: 15),
+        maxIterations: BenchEnv.focus ? 50 : 250
     )
 
-    for tasks in [1, 2, 4, 8, 16, 64, 192] {
+    let taskList = BenchEnv.focus ? [8, 16, 64, 192] : [1, 2, 4, 8, 16, 64, 192]
+
+    func emit(_ tasks: Int, _ cfg: BenchConfig, _ v: MutexVariant, dumpLabel: String? = nil) {
+        Benchmark("tasks=\(tasks) \(v.name)") { benchmark in
+            let h = v.make(defaultMapCapacity)
+            benchmark.startMeasurement()
+            await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
+                h.runLocked { $0.update(iterations: cfg.work) }
+            }
+            benchmark.stopMeasurement()
+            if let label = dumpLabel { h.dumpStats?(label) }
+        }
+    }
+
+    for tasks in taskList {
         let cfg = BenchConfig(tasks: tasks, work: 1)
 
-        // Baselines
-        Benchmark("tasks=\(tasks) Synchronization.Mutex") { benchmark in
-            let box = SyncMutexBox(capacity: defaultMapCapacity)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) { box.work(cfg.work) }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("tasks=\(tasks) NIOLockedValueBox") { benchmark in
-            let box = NIOLockBox(capacity: defaultMapCapacity)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) { box.work(cfg.work) }
-            benchmark.stopMeasurement()
+        if !BenchEnv.focus {
+            emit(tasks, cfg, .niolock())
         }
 
         #if os(Linux)
-        // The recommended algorithm — hardcoded winner config.
-        Benchmark("tasks=\(tasks) Optimal") { benchmark in
-            let m = OptimalMutex(MapState(capacity: defaultMapCapacity))
-            benchmark.startMeasurement()
-            await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                m.withLock { $0.update(iterations: cfg.work) }
-            }
-            benchmark.stopMeasurement()
-        }
+        emit(tasks, cfg, .optimal())
 
-        // PI-futex with no spinning — isolates PI syscall overhead
-        Benchmark("tasks=\(tasks) PI no-spin") { benchmark in
-            let m = SynchronizationMutex(MapState(capacity: defaultMapCapacity), spinTries: 0)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                m.withLock { $0.update(iterations: cfg.work) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        // Plain futex, park immediately
-        Benchmark("tasks=\(tasks) spin=0") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: defaultMapCapacity), spinTries: 0)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                m.withLock { $0.update(iterations: cfg.work) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        // Fixed spin
-        for spin in [14, 40] {
-            Benchmark("tasks=\(tasks) spin=\(spin) fixed") { benchmark in
-                let m = PlainFutexMutex(
-                    MapState(capacity: defaultMapCapacity),
-                    spinTries: spin
-                )
-                benchmark.startMeasurement()
-                await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                    m.withLock { $0.update(iterations: cfg.work) }
-                }
-                benchmark.stopMeasurement()
+        if !BenchEnv.focus {
+            emit(tasks, cfg, .rustMutex())
+            for v in rustTuningGrid { emit(tasks, cfg, v) }
+            if BenchEnv.rustDemote {
+                for v in rustDemoteVariants { emit(tasks, cfg, v) }
             }
         }
 
-        // Backoff with different caps
-        for spin in [14, 40] {
-            // cap=8 (Rust-style)
-            Benchmark("tasks=\(tasks) spin=\(spin) backoff cap=8") { benchmark in
-                let m = PlainFutexMutex(
-                    MapState(capacity: defaultMapCapacity),
-                    spinTries: spin,
-                    useBackoff: true,
-                    backoffCap: 8
-                )
+        // ---- Instrumented runs (t=8, t=16, stats dumped to stderr) ----
+        if tasks == 8 || tasks == 16 {
+            emit(tasks, cfg, .optimal(name: "INSTR Optimal", instrument: true),
+                 dumpLabel: "Optimal t=\(tasks)")
+
+            if !BenchEnv.focus {
+                emit(tasks, cfg, .rustMutex(name: "INSTR RustMutex", instrument: true),
+                     dumpLabel: "RustMutex t=\(tasks)")
+                emit(tasks, cfg, .rustMutex(
+                    name: "INSTR RustMutex sp=100 × 16 retry=20",
+                    spinTries: 100, pausesPerIter: 16, outerRetries: 20, instrument: true
+                ), dumpLabel: "RustMutex sp=100x16 retry=20 t=\(tasks)")
+                if BenchEnv.rustDemote {
+                    emit(tasks, cfg, .rustMutex(
+                        name: "INSTR RustMutex demote+skipWake",
+                        skipSpuriousWake: true, demoteOnEmpty: true, instrument: true
+                    ), dumpLabel: "RustMutex demote+skipWake t=\(tasks)")
+                }
+            }
+
+            for v in stInstrDepthSweep {
+                let dumpName = v.name.replacingOccurrences(of: "INSTR ", with: "")
+                emit(tasks, cfg, v, dumpLabel: "\(dumpName) t=\(tasks)")
+            }
+        }
+
+        if !BenchEnv.focus {
+            for v in stBestVariations { emit(tasks, cfg, v) }
+        }
+
+        if BenchEnv.experiment {
+            emit(tasks, cfg, .syncMutex(name: "EXP Synchronization.Mutex"))
+            emit(tasks, cfg, .piNoSpin(name: "EXP PI no-spin"))
+            emit(tasks, cfg, .plainFutex(name: "EXP spin=0", spinTries: 0))
+            for spin in [14, 40] {
+                emit(tasks, cfg, .plainFutex(name: "EXP spin=\(spin) fixed", spinTries: spin))
+            }
+            emit(tasks, cfg, .plainFutex(
+                name: "EXP early-exit spin=40 jitter",
+                spinTries: 40, earlyExitOnWaiters: true,
+                useBackoff: true, backoffCap: 32, backoffFloor: 4,
+                useJitter: true
+            ))
+            for spins in [3, 5, 10] {
+                emit(tasks, cfg, .plainFutex(
+                    name: "EXP early-exit spin=\(spins) hwjitter base=128",
+                    spinTries: spins, earlyExitOnWaiters: true,
+                    backoffCap: 128, useHWJitter: true
+                ))
+            }
+            emit(tasks, cfg, .plainFutex(
+                name: "EXP early-exit spin=20 hwjitter base=64",
+                spinTries: 20, earlyExitOnWaiters: true,
+                backoffCap: 64, useHWJitter: true
+            ))
+            for base: UInt32 in [16, 32, 64, 96, 128] {
+                let isPow2 = base & (base - 1) == 0
+                if isPow2 {
+                    emit(tasks, cfg, .plainFutex(
+                        name: "EXP early-exit spin=40 hwjitter base=\(base)",
+                        spinTries: 40, earlyExitOnWaiters: true,
+                        backoffCap: base, useHWJitter: true
+                    ))
+                }
+                emit(tasks, cfg, .plainFutex(
+                    name: "EXP early-exit spin=40 flat\(base)",
+                    spinTries: 40, earlyExitOnWaiters: true,
+                    useBackoff: true, backoffCap: base, backoffFloor: base
+                ))
+            }
+            for (cap, base): (UInt32, UInt32) in [
+                (10, 64), (10, 128),
+                (20, 64), (20, 128),
+                (40, 64), (40, 128),
+                (100, 64),
+            ] {
+                emit(tasks, cfg, .adaptiveSpin(
+                    name: "EXP adaptive cap=\(cap) base=\(base)",
+                    maxCap: cap, pauseBase: base
+                ))
+            }
+            // TwoStage/Epoch/Hint: none beat Optimal; kept inline (no variant
+            // factories since these are rarely used and take no params).
+            Benchmark("tasks=\(tasks) EXP two-stage 5/128 + 5/32") { benchmark in
+                let m = TwoStageMutex(MapState(capacity: defaultMapCapacity))
                 benchmark.startMeasurement()
                 await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
                     m.withLock { $0.update(iterations: cfg.work) }
                 }
                 benchmark.stopMeasurement()
             }
-
-            // cap=32 (previous)
-            Benchmark("tasks=\(tasks) spin=\(spin) backoff cap=32") { benchmark in
-                let m = PlainFutexMutex(
-                    MapState(capacity: defaultMapCapacity),
-                    spinTries: spin,
-                    useBackoff: true,
-                    backoffCap: 32
-                )
+            Benchmark("tasks=\(tasks) EXP epoch spin=40 base=128") { benchmark in
+                let m = EpochMutex(MapState(capacity: defaultMapCapacity), spinTries: 40, pauseBase: 128)
                 benchmark.startMeasurement()
                 await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
                     m.withLock { $0.update(iterations: cfg.work) }
                 }
                 benchmark.stopMeasurement()
             }
-
-            // Adaptive cap: 256/nproc, clamped [4,32]
-            Benchmark("tasks=\(tasks) spin=\(spin) backoff adaptive") { benchmark in
-                let m = PlainFutexMutex(
-                    MapState(capacity: defaultMapCapacity),
-                    spinTries: spin,
-                    useBackoff: true,
-                    backoffCap: adaptive_backoff_cap()
-                )
+            Benchmark("tasks=\(tasks) EXP hint spin=40 base=128") { benchmark in
+                let m = HintMutex(MapState(capacity: defaultMapCapacity), spinTries: 40, pauseBase: 128)
                 benchmark.startMeasurement()
                 await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
                     m.withLock { $0.update(iterations: cfg.work) }
                 }
                 benchmark.stopMeasurement()
             }
-
-            // Adaptive + separate cache line (lock word and value on different 64B lines)
-            Benchmark("tasks=\(tasks) spin=\(spin) backoff adaptive+sep") { benchmark in
-                let m = PlainFutexMutex(
-                    MapState(capacity: defaultMapCapacity),
-                    spinTries: spin,
-                    useBackoff: true,
-                    backoffCap: adaptive_backoff_cap(),
-                    separateCacheLine: true
-                )
-                benchmark.startMeasurement()
-                await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                    m.withLock { $0.update(iterations: cfg.work) }
-                }
-                benchmark.stopMeasurement()
-            }
-
-            // Regime-gated cap: cap flips based on observed state each iter.
-            //   state==1 (no waiters parked)       → capHigh=32 (long backoff)
-            //   state==2 (waiters parked / busy)   → capLow=6   (tight checks)
-            // Confirmed winner on 12c+40c+64c (see project_findings_40c.md).
-            Benchmark("tasks=\(tasks) spin=\(spin) regime-gated") { benchmark in
-                let m = PlainFutexMutex(
-                    MapState(capacity: defaultMapCapacity),
-                    spinTries: spin,
-                    useBackoff: true,
-                    regimeGatedCap: true,
-                    capHigh: 32,
-                    capLow: 6
-                )
-                benchmark.startMeasurement()
-                await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                    m.withLock { $0.update(iterations: cfg.work) }
-                }
-                benchmark.stopMeasurement()
-            }
-
-            // Regime-gated + separateCacheLine (lock word and value on
-            // different 64B lines). §10 showed separation helps 17-22% on
-            // 12c single-die Intel but is neutral/negative on 64c EPYC
-            // chiplet (Infinity Fabric penalty). Question: does the regime-
-            // gated win stack additively with separation on 12c, and does
-            // 64c's chiplet penalty still dominate here?
-            Benchmark("tasks=\(tasks) spin=\(spin) regime-gated+sep") { benchmark in
-                let m = PlainFutexMutex(
-                    MapState(capacity: defaultMapCapacity),
-                    spinTries: spin,
-                    useBackoff: true,
-                    separateCacheLine: true,
-                    regimeGatedCap: true,
-                    capHigh: 32,
-                    capLow: 6
-                )
-                benchmark.startMeasurement()
-                await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                    m.withLock { $0.update(iterations: cfg.work) }
-                }
-                benchmark.stopMeasurement()
-            }
-
-            // Regime-gated + backoff floor=4: hypothesis for closing the
-            // 64c state==2 chiplet gap. Starting backoff at 4 instead of 1
-            // skips tight early iterations that on EPYC cause cross-CCD
-            // cache-line traffic before any release can arrive. capLow=6
-            // stays the ceiling for state==2 regime.
-            Benchmark("tasks=\(tasks) spin=\(spin) regime-gated floor=4") { benchmark in
-                let m = PlainFutexMutex(
-                    MapState(capacity: defaultMapCapacity),
-                    spinTries: spin,
-                    useBackoff: true,
-                    regimeGatedCap: true,
-                    capHigh: 32,
-                    capLow: 6,
-                    backoffFloor: 4
-                )
-                benchmark.startMeasurement()
-                await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                    m.withLock { $0.update(iterations: cfg.work) }
-                }
-                benchmark.stopMeasurement()
-            }
-
-            // Regime-gated + sticky parked-regime detection.
-            // Addresses the Phase B cache-traffic cost the base regime-gated
-            // still pays: once state==2 has been stable for N iterations,
-            // bail to futex_wait rather than keep polling the hot shared
-            // line. Also jump backoff to capLow on state==2 entry to avoid
-            // ramping up from lower values in a regime about to terminate.
-            // Expected to help 64c tasks≥16 and 40c tasks=64 (the residual
-            // gaps where plain regime-gated shows cache-pressure symptoms).
-            for threshold: UInt32 in [3, 5] {
-                Benchmark("tasks=\(tasks) spin=\(spin) regime-gated sticky=\(threshold)") { benchmark in
-                    let m = PlainFutexMutex(
-                        MapState(capacity: defaultMapCapacity),
-                        spinTries: spin,
-                        useBackoff: true,
-                        regimeGatedCap: true,
-                        capHigh: 32,
-                        capLow: 6,
-                        stickyParkThreshold: threshold
-                    )
-                    benchmark.startMeasurement()
-                    await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                        m.withLock { $0.update(iterations: cfg.work) }
-                    }
-                    benchmark.stopMeasurement()
-                }
-            }
-
-            // Sticky + floor=4 stacked.
-            Benchmark("tasks=\(tasks) spin=\(spin) regime-gated sticky=3 floor=4") { benchmark in
-                let m = PlainFutexMutex(
-                    MapState(capacity: defaultMapCapacity),
-                    spinTries: spin,
-                    useBackoff: true,
-                    regimeGatedCap: true,
-                    capHigh: 32,
-                    capLow: 6,
-                    backoffFloor: 4,
-                    stickyParkThreshold: 3
-                )
-                benchmark.startMeasurement()
-                await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                    m.withLock { $0.update(iterations: cfg.work) }
-                }
-                benchmark.stopMeasurement()
-            }
+            // Separate cache line: 17-22% help on Intel single-die, hurts AMD.
+            emit(tasks, cfg, .plainFutex(
+                name: "EXP early-exit spin=40 hwjitter64+sep",
+                spinTries: 40, earlyExitOnWaiters: true,
+                backoffCap: 64, useHWJitter: true, separateCacheLine: true
+            ))
         }
         #endif
     }
+
+    // ---- t=32 OptimalMutex INSTR (standalone — 32 not in main loop) ----
+    #if os(Linux)
+    do {
+        let cfg = BenchConfig(tasks: 32, work: 1)
+        emit(32, cfg, .optimal(name: "INSTR Optimal", instrument: true),
+             dumpLabel: "Optimal t=32")
+    }
+    #endif
 }

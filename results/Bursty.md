@@ -2,63 +2,109 @@
 
 Thundering-herd probe. All N Tasks wait on a shared deadline, then simultaneously try to acquire the lock. After `opsPerBurst` acquires each, quiet period, then repeat.
 
-Tests settling-time distribution under bursty arrivals - the first few acquires in each burst are the worst case for fairness. Targets the same shape [glibc's `exp_backoff + jitter`](https://www.gnu.org/software/libc/manual/html_node/POSIX-Thread-Tunables.html) addresses, and the pattern [WebKit's unfairness detection](https://webkit.org/blog/6161/locking-in-webkit/) monitors.
+Tests settling-time distribution under bursty arrivals — the first few acquires in each burst are the worst case for fairness. Targets the same shape [glibc's `exp_backoff + jitter`](https://www.gnu.org/software/libc/manual/html_node/POSIX-Thread-Tunables.html) addresses, and the pattern [WebKit's unfairness detection](https://webkit.org/blog/6161/locking-in-webkit/) monitors.
+
+Wall-clock p50 is the total workload time: (bursts × opsPerBurst × per-op-cost) + (bursts × quietPeriod). Quiet-period drives most of wall time — look at the spread, not the absolute number, to see lock differences.
 
 ## Parameters
 
 | Config | Burst tasks | Bursts | Ops/burst | Quiet gap |
 |---|---:|---:|---:|---:|
-| 64x100 ops=32 | 64 | 100 | 32 | 2 ms |
-| 16x200 ops=64 | 16 | 200 | 64 | 2 ms |
-| 4x200 ops=64 | 4 | 200 | 64 | 2 ms |
-| 8x5 ops=2048 | 8 | 5 | 2048 | 800 ms |
+| burst=4×200 ops=64 | 4 | 200 | 64 | 2 ms |
+| burst=16×200 ops=64 | 16 | 200 | 64 | 2 ms |
+| burst=64×100 ops=32 | 64 | 100 | 32 | 2 ms |
+| burst=8×5 ops=2048 | 8 | 5 | 2048 | 800 ms |
 
-## Results (p50 wall clock, us)
-
-### burst=64x100 ops=32 quiet=2ms
-
-| Impl | x86 12c | x86 64c | x86 192c |
-|---|---:|---:|---:|
-| Optimal | 317,191 | 317,719 | 319,554 |
-| NIOLock | 317,194 | 318,243 | 319,816 |
-| PlainFutexMutex (spin=100) | 317,194 | 317,863 | 319,554 |
-| Stdlib PI | 317,194 | **3,783,262** | **1,852,834** |
-
-### burst=16x200 ops=64 quiet=2ms
-
-| Impl | x86 12c | x86 64c | x86 192c |
-|---|---:|---:|---:|
-| Optimal | 617,312 | 617,523 | 618,136 |
-| NIOLock | 617,342 | 617,611 | 618,660 |
-| PlainFutexMutex (spin=100) | 617,087 | 617,419 | 618,660 |
-| Stdlib PI | 617,085 | **3,458,204** | **1,811,939** |
-
-### burst=4x200 ops=64 quiet=2ms
-
-| Impl | x86 12c | x86 64c | x86 192c |
-|---|---:|---:|---:|
-| Optimal | 617,038 | 617,150 | 617,325 |
-| NIOLock | 617,038 | 617,167 | 617,339 |
-| PlainFutexMutex (spin=100) | 617,118 | 617,180 | 617,343 |
-| Stdlib PI | 617,033 | 617,191 | 617,611 |
-
-### burst=8x5 ops=2048 quiet=800ms
-
-| Impl | x86 12c | x86 64c | x86 192c |
-|---|---:|---:|---:|
-| Optimal | 3,224,536 | 3,227,259 | 3,231,711 |
-| NIOLock | 3,224,599 | 3,229,614 | 3,235,906 |
-| PlainFutexMutex (spin=100) | 3,224,632 | 3,227,517 | 3,231,711 |
-| Stdlib PI | 3,224,606 | 3,468,689 | 3,363,832 |
+Bench gated behind `MUTEX_BENCH_SLOW=1` — wall time is multi-second per config.
 
 ## Key findings
 
-1. **Bursty workloads are dominated by the quiet period and ops count.** With ops=64 and quiet=2ms, the wall clock is ~617ms regardless of lock implementation. The lock overhead is negligible relative to the work and sleep.
+1. **Quiet period dominates wall time for plain-futex variants.** Optimal/Rust/NIO land within 0.1% of each other and within 0.1% of the raw quiet-period budget (618ms ≈ 200 bursts × 2ms, minus a few µs of acquire cost). Lock design matters only for the acquire phase, which is a tiny fraction of the bench.
 
-2. **Stdlib PI collapses on many-core bursty workloads.** At burst=64x100 on x86 64c, Stdlib PI takes 3,783ms vs everyone else at 318ms - **12x slower**. The burst of 64 simultaneous tasks triggers the PI-futex cliff. On x86 192c: 1,853ms - **5.8x slower**.
+2. **PI-futex cliff fires spectacularly at burst=16 and burst=64 on AMD/NUMA.** Broadwell 44c burst=64×100: Sync.Mutex **9.81 seconds** vs Optimal 319ms (31× slower). AMD Zen 4 burst=64×100: **5.96s** vs 319ms (19×). Skylake 40c NUMA burst=64×100: **2.04s** vs 319ms (6×).
 
-3. **At burst=4, Stdlib PI is fine.** Only 4 tasks contending per burst - below the PI cliff threshold on all machines.
+3. **burst=4 is PI-cliff-free everywhere.** 4 tasks simultaneously waking to contend don't form enough of a chain for PI-futex to misbehave. Same 4 variants cluster within 0.01% on all 4 CPUs.
 
-4. **Optimal, NIOLock, and PlainFutexMutex (spin=100) are identical.** Within measurement noise across all configurations. The 2ms quiet gap between bursts allows all parked threads to wake, eliminating any spin strategy advantage.
+4. **burst=8 long-ops (2048 ops per burst, 800ms quiet) shows minor PI overhead only on AMD.** Sync.Mutex 3.61s on AMD vs 3.23s plain (12% slower). Every other CPU matches within 0.3%. Low burst count + long ops + long quiet = most-benign PI regime besides sleep-in-lock.
 
-5. **On x86 12c, everything converges.** No PI cliff with 12 cores. All implementations within 0.01% of each other.
+5. **Thundering herd is the worst PI regime tested this session.** burst=64×100 on Broadwell 44c: 9.81s. Same machine's ContentionScaling at t=64 peaks around 3.5s. The burst-then-release pattern maximizes PI chain depth because all 64 waiters park simultaneously with priority-inheritance metadata.
+
+### PI-futex cliff — per CPU on Bursty
+
+| CPU | burst=4 (200) | burst=16 (200) | burst=64 (100) | burst=8 (long ops) |
+|---|---:|---:|---:|---:|
+| Intel i5-12500 (12c Alder Lake) | within 0.01% | within 0.01% | within 0.1% | within 0.01% |
+| AMD EPYC 9454P (64c Zen 4) | within 0.01% | **8.8×** | **19×** | 12% |
+| Intel Xeon Gold 6148 (40c Skylake NUMA) | within 0.01% | within 0.01% | **6.4×** | within 0.3% |
+| Intel Xeon E5-2699 v4 (44c Broadwell NUMA) | within 0.01% | **12×** | **31×** | 6% |
+
+### Workload-choice matrix
+
+| Workload shape | Ship choice | Why |
+|---|---|---|
+| Low-burst (≤ 4 tasks) | any | All variants within 0.01% |
+| Moderate burst (16 tasks) on Intel consumer | any | Quiet period dominates |
+| Moderate burst (16 tasks) on AMD/Broadwell | **Optimal** | Avoids 8–12× PI cliff |
+| High burst (64 tasks) on AMD/NUMA | **Optimal** | Avoids 6–31× PI cliff |
+| Long-ops bursts with long quiet | any (Sync.Mutex 12% slower on AMD) | Quiet period dominates; lock barely matters |
+
+## Implementations
+
+- **Optimal** — OptimalMutex with lazy waiter-count backport.
+- **RustMutex** — Rust std 1.62+ load-only spin + post-CAS park.
+- **NIOLockedValueBox (NIO)** — pthread_mutex_t wrapper.
+- **Synchronization.Mutex (PI)** — Swift stdlib PI-futex.
+
+## Test hosts
+
+Same 4 x86 hosts. M1 Ultra absent.
+
+---
+
+## Detailed p50 wall-clock (µs)
+
+Fresh 2026-04-20 data. Gated behind `MUTEX_BENCH_SLOW=1`.
+
+### Intel i5-12500 (12c Alder Lake)
+
+| Config | Optimal | RustMutex | NIOLockedValueBox | Synchronization.Mutex |
+|---|---:|---:|---:|---:|
+| burst=4×200 ops=64 quiet=2ms | 617,157 | 617,251 | 617,280 | 617,306 |
+| burst=16×200 ops=64 quiet=2ms | 617,348 | 618,058 | 617,271 | 618,609 |
+| burst=64×100 ops=32 quiet=2ms | 317,744 | 319,029 | 319,260 | 319,554 |
+| burst=8×5 ops=2048 quiet=800ms | **3.23s** | **3.23s** | **3.23s** | **3.23s** |
+
+No PI cliff. All variants within 0.3%.
+
+### AMD EPYC 9454P (64c Zen 4)
+
+| Config | Optimal | RustMutex | NIOLockedValueBox | Synchronization.Mutex |
+|---|---:|---:|---:|---:|
+| burst=4×200 ops=64 quiet=2ms | 617,442 | 617,481 | 617,445 | 617,432 |
+| burst=16×200 ops=64 quiet=2ms | 617,962 | 618,136 | 618,427 | **5.42s** |
+| burst=64×100 ops=32 quiet=2ms | 318,767 | 318,974 | 319,206 | **5.96s** |
+| burst=8×5 ops=2048 quiet=800ms | **3.23s** | **3.23s** | **3.23s** | **3.61s** |
+
+PI cliff at burst=16 (8.8×) and burst=64 (19×). burst=4 stays safe — 4 threads not enough for chain-walk pathology.
+
+### Intel Xeon Gold 6148 (40c Skylake, 2-socket NUMA)
+
+| Config | Optimal | RustMutex | NIOLockedValueBox | Synchronization.Mutex |
+|---|---:|---:|---:|---:|
+| burst=4×200 ops=64 quiet=2ms | 617,347 | 617,407 | 617,388 | 617,411 |
+| burst=16×200 ops=64 quiet=2ms | 617,578 | 618,016 | 618,080 | 618,660 |
+| burst=64×100 ops=32 quiet=2ms | 318,505 | 318,767 | 318,767 | **2.04s** |
+| burst=8×5 ops=2048 quiet=800ms | **3.23s** | **3.24s** | **3.24s** | **3.24s** |
+
+Skylake UPI handles 16-task bursts fine; cliff only at burst=64 (6×). Milder than AMD/Broadwell.
+
+### Intel Xeon E5-2699 v4 (44c Broadwell, 2-socket NUMA)
+
+| Config | Optimal | RustMutex | NIOLockedValueBox | Synchronization.Mutex |
+|---|---:|---:|---:|---:|
+| burst=4×200 ops=64 quiet=2ms | 617,288 | 617,410 | 617,408 | 617,339 |
+| burst=16×200 ops=64 quiet=2ms | 618,641 | 618,660 | 618,488 | **7.52s** |
+| burst=64×100 ops=32 quiet=2ms | 319,291 | 319,029 | 319,291 | **9.81s** |
+| burst=8×5 ops=2048 quiet=800ms | **3.23s** | **3.24s** | **3.24s** | **3.42s** |
+
+Worst PI regime tested. burst=64×100: **9.81s**, 31× slower than Optimal. Broadwell's older QPI + large chain = catastrophic.

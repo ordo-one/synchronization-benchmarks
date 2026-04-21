@@ -87,6 +87,28 @@ public final class PlainFutexMutex<Value>: @unchecked Sendable {
     /// Default 0 = disabled (current behavior). Typical values: 2-5.
     public let stickyParkThreshold: UInt32
 
+    /// Load-only spin (Rust std style). Spin loop only does relaxed loads —
+    /// no CAS inside the loop. Exits on state != locked (unlocked or contended).
+    /// CAS attempt happens after loop exit. Generates zero exclusive cache-line
+    /// traffic during spin. Compare with default (inline CAS on unlocked).
+    public let loadOnlySpin: Bool
+
+    /// glibc-style random jitter on backoff. Each iteration's pause count is:
+    ///   backoff + (jitter & (backoff - 1))
+    /// where jitter is a cheap PRNG state. Desynchronizes competing spinners
+    /// that would otherwise all check the lock at the same instant (CAS storm).
+    public let useJitter: Bool
+
+    /// Seed jitter PRNG from thread ID instead of lock address.
+    /// Default (false) seeds from lock address — same for all threads on same lock.
+    /// When true, seeds from gettid() — unique per thread, true desynchronization.
+    public let perThreadJitter: Bool
+
+    /// Use hardware timestamp (RDTSC/CNTVCT_EL0) for jitter, glibc style.
+    /// Read once per lock attempt. Naturally unique per thread per acquire.
+    /// No PRNG state, no seed. Overrides useJitter/perThreadJitter when true.
+    public let useHWJitter: Bool
+
     // Lock word states
     @usableFromInline static var UNLOCKED: UInt32 { 0 }
     @usableFromInline static var LOCKED: UInt32 { 1 }
@@ -104,12 +126,22 @@ public final class PlainFutexMutex<Value>: @unchecked Sendable {
         capHigh: UInt32 = 32,
         capLow: UInt32 = 6,
         backoffFloor: UInt32 = 1,
-        stickyParkThreshold: UInt32 = 0
+        stickyParkThreshold: UInt32 = 0,
+        loadOnlySpin: Bool = false,
+        useJitter: Bool = false,
+        perThreadJitter: Bool = false,
+        useHWJitter: Bool = false
     ) {
         let valueOffset: Int
         if separateCacheLine {
-            // 64-byte cache line boundary between lock word and value
-            valueOffset = Swift.max(64, MemoryLayout<Value>.alignment)
+            // Separate cache lines between lock word and value.
+            // x86: 64-byte lines. Apple Silicon (aarch64): 128-byte lines.
+            #if arch(arm64)
+            let cacheLineSize = 128
+            #else
+            let cacheLineSize = 64
+            #endif
+            valueOffset = Swift.max(cacheLineSize, MemoryLayout<Value>.alignment)
         } else {
             valueOffset = Swift.max(
                 MemoryLayout<UInt32>.stride,
@@ -138,6 +170,10 @@ public final class PlainFutexMutex<Value>: @unchecked Sendable {
         self.capLow = capLow
         self.backoffFloor = backoffFloor
         self.stickyParkThreshold = stickyParkThreshold
+        self.loadOnlySpin = loadOnlySpin
+        self.useJitter = useJitter
+        self.perThreadJitter = perThreadJitter
+        self.useHWJitter = useHWJitter
     }
 
     deinit {
@@ -176,6 +212,19 @@ public final class PlainFutexMutex<Value>: @unchecked Sendable {
             var tries = spinTries
             var backoff: UInt32 = backoffFloor  // doubles each iteration when useBackoff=true; starts at floor to skip tight early iters
             var consecutiveState2: UInt32 = 0   // for sticky-parked-regime detection
+            // Jitter source — read once, reuse across iterations (glibc style).
+            var jitterState: UInt32
+            if useHWJitter {
+                jitterState = fast_jitter()  // RDTSC / CNTVCT_EL0
+            } else if perThreadJitter {
+                var h = UInt32(truncatingIfNeeded: mutex_gettid())
+                h ^= h &>> 16; h &*= 0x85EBCA6B
+                h ^= h &>> 13; h &*= 0xC2B2AE35
+                h ^= h &>> 16
+                jitterState = h
+            } else {
+                jitterState = UInt32(truncatingIfNeeded: UInt(bitPattern: word))
+            }
 
             repeat {
                 let state = atomic_load_relaxed_u32(word)
@@ -186,8 +235,14 @@ public final class PlainFutexMutex<Value>: @unchecked Sendable {
                     break
                 }
 
-                if state == 0, atomic_cas_acquire_u32(word, 0, 1) {
-                    return
+                if loadOnlySpin {
+                    // Load-only: exit on unlocked, CAS after loop
+                    if state == 0 { break }
+                } else {
+                    // Default: inline CAS when load shows unlocked
+                    if state == 0, atomic_cas_acquire_u32(word, 0, 1) {
+                        return
+                    }
                 }
 
                 // Sticky-parked-regime detection.
@@ -222,13 +277,46 @@ public final class PlainFutexMutex<Value>: @unchecked Sendable {
                     let cap: UInt32 = regimeGatedCap
                         ? (state == 2 ? capLow : capHigh)
                         : backoffCap
-                    for _ in 0..<backoff { spin_loop_hint() }
+                    // Jitter: backoff + (jitter & (backoff - 1))
+                    var pauseCount = backoff
+                    if useHWJitter, backoff > 1 {
+                        // glibc style: HW timestamp, same value every iteration
+                        pauseCount = backoff &+ (jitterState & (backoff &- 1))
+                    } else if useJitter, backoff > 1 {
+                        // PRNG style: different value each iteration
+                        jitterState &+= 0x9E3779B9
+                        jitterState ^= jitterState &>> 16
+                        pauseCount = backoff &+ (jitterState & (backoff &- 1))
+                    }
+                    for _ in 0..<pauseCount { spin_loop_hint() }
                     if backoff < cap { backoff &<<= 1 }
                     else if backoff > cap { backoff = cap }  // shrink on regime→tight
+                } else if useHWJitter {
+                    // Flat spin + HW jitter (glibc style): base + (tsc & (base-1)).
+                    // jitterState is RDTSC/CNTVCT read once — same offset every iter.
+                    // Desynchronizes across threads, not across iterations.
+                    let base = backoffCap
+                    let pauseCount: UInt32 = base &+ (jitterState & (base &- 1))
+                    for _ in 0..<pauseCount { spin_loop_hint() }
+                } else if useJitter {
+                    // Flat spin + PRNG jitter: base + rand(0..base-1).
+                    // Different offset each iteration (PRNG steps).
+                    jitterState &+= 0x9E3779B9
+                    jitterState ^= jitterState &>> 16
+                    let base = backoffCap
+                    let pauseCount: UInt32 = base &+ (jitterState & (base &- 1))
+                    for _ in 0..<pauseCount { spin_loop_hint() }
                 } else {
                     spin_loop_hint()
                 }
             } while tries > 0
+        }
+
+        // Load-only post-spin: try CAS now that we exited the loop.
+        // If we exited because state was unlocked, attempt acquire before
+        // falling through to the expensive kernel phase.
+        if loadOnlySpin {
+            if atomic_cas_acquire_u32(word, 0, 1) { return }
         }
 
         // --- Kernel phase ---

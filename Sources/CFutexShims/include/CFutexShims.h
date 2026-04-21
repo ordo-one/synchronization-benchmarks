@@ -84,6 +84,10 @@ static inline uint32_t atomic_load_relaxed_u32(uint32_t *addr) {
     return __atomic_load_n(addr, __ATOMIC_RELAXED);
 }
 
+static inline uint32_t atomic_load_acquire_u32(uint32_t *addr) {
+    return __atomic_load_n(addr, __ATOMIC_ACQUIRE);
+}
+
 static inline void atomic_store_relaxed_u32(uint32_t *addr, uint32_t val) {
     __atomic_store_n(addr, val, __ATOMIC_RELAXED);
 }
@@ -112,13 +116,81 @@ static inline bool atomic_cas_release_u32(
     );
 }
 
+// Atomic fetch-add — returns previous value.
+static inline uint32_t atomic_fetch_add_u32(uint32_t *addr, uint32_t val) {
+    return __atomic_fetch_add(addr, val, __ATOMIC_ACQ_REL);
+}
+
+static inline uint32_t atomic_fetch_sub_u32(uint32_t *addr, uint32_t val) {
+    return __atomic_fetch_sub(addr, val, __ATOMIC_ACQ_REL);
+}
+
+// Atomic fetch-or / fetch-and — returns previous value.
+// Used for setting/clearing individual bits (e.g. STARVING flag) without
+// CAS-loop overhead. Single LOCK OR / LOCK AND instructions on x86.
+static inline uint32_t atomic_fetch_or_u32(uint32_t *addr, uint32_t val) {
+    return __atomic_fetch_or(addr, val, __ATOMIC_ACQ_REL);
+}
+
+static inline uint32_t atomic_fetch_and_u32(uint32_t *addr, uint32_t val) {
+    return __atomic_fetch_and(addr, val, __ATOMIC_ACQ_REL);
+}
+
+// Monotonic nanosecond clock (vDSO-backed on Linux 5.3+). Used for
+// Go-style starvation threshold timing. CLOCK_MONOTONIC excludes system
+// suspend time — "wait duration" should not inflate if host suspends
+// mid-park. Matches Go's runtime_nanotime().
+#include <time.h>
+static inline uint64_t mutex_clock_ns(void) {
+    struct timespec ts;
+    clock_gettime(CLOCK_MONOTONIC, &ts);
+    return (uint64_t)ts.tv_sec * 1000000000ULL + (uint64_t)ts.tv_nsec;
+}
+
 // Atomic exchange — returns previous value.
 static inline uint32_t atomic_exchange_acquire_u32(uint32_t *addr, uint32_t val) {
     return __atomic_exchange_n(addr, val, __ATOMIC_ACQUIRE);
 }
 
+// --- u64 relaxed atomics (for instrumentation counters only) ---
+
+static inline uint64_t atomic_load_relaxed_u64(uint64_t *addr) {
+    return __atomic_load_n(addr, __ATOMIC_RELAXED);
+}
+
+static inline uint64_t atomic_fetch_add_u64_relaxed(uint64_t *addr, uint64_t val) {
+    return __atomic_fetch_add(addr, val, __ATOMIC_RELAXED);
+}
+
 static inline uint32_t atomic_exchange_release_u32(uint32_t *addr, uint32_t val) {
     return __atomic_exchange_n(addr, val, __ATOMIC_RELEASE);
+}
+
+// --- Atomic pointer ops (for MCS queue and similar) ---
+
+static inline void *atomic_load_relaxed_ptr(void **addr) {
+    return __atomic_load_n(addr, __ATOMIC_RELAXED);
+}
+
+static inline void *atomic_load_acquire_ptr(void **addr) {
+    return __atomic_load_n(addr, __ATOMIC_ACQUIRE);
+}
+
+static inline void atomic_store_release_ptr(void **addr, void *val) {
+    __atomic_store_n(addr, val, __ATOMIC_RELEASE);
+}
+
+// Fetch-and-store (FAS / xchg) for pointers — returns previous value.
+static inline void *atomic_exchange_acquire_ptr(void **addr, void *val) {
+    return __atomic_exchange_n(addr, val, __ATOMIC_ACQUIRE);
+}
+
+// CAS for pointers — returns true if stored.
+static inline bool atomic_cas_release_ptr(void **addr, void *expected, void *desired) {
+    return __atomic_compare_exchange_n(
+        addr, &expected, desired,
+        /*weak=*/false, __ATOMIC_RELEASE, __ATOMIC_RELAXED
+    );
 }
 
 // ---------------------------------------------------------------------------
@@ -157,6 +229,30 @@ static inline int default_spin_tries(void) { return 100; }
 
 static inline void spin_loop_hint(void) {}
 static inline int default_spin_tries(void) { return 100; }
+
+#endif
+
+// ---------------------------------------------------------------------------
+// Fast jitter source (glibc style — hardware timestamp, read once per acquire)
+// ---------------------------------------------------------------------------
+
+#if defined(__x86_64__) || defined(__i386__)
+
+static inline uint32_t fast_jitter(void) {
+    return (uint32_t)__builtin_ia32_rdtsc();
+}
+
+#elif defined(__aarch64__)
+
+static inline uint32_t fast_jitter(void) {
+    uint64_t val;
+    __asm__ __volatile__("isb\nmrs %0, cntvct_el0" : "=r"(val));
+    return (uint32_t)val;
+}
+
+#else
+
+static inline uint32_t fast_jitter(void) { return 0; }
 
 #endif
 

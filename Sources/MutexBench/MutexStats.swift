@@ -1,0 +1,75 @@
+//===----------------------------------------------------------------------===//
+// MutexStats — per-mutex instrumentation counters.
+//
+// Off by default (init flag on RustMutex/OptimalMutex). When enabled, tracks
+// every decision point in the slow path so we can answer questions like:
+//   - how often does the spin CAS win vs lose a race?
+//   - how many threads park per release event?
+//   - how much wasted spin budget is burned before parking?
+//
+// Relaxed atomics — counters only need monotonic ordering, not memory
+// ordering against the lock word. Incremented via hot-path branch
+// (`if let s = stats`) so the non-instrumented path stays zero-overhead.
+//===----------------------------------------------------------------------===//
+
+#if os(Linux)
+import CFutexShims
+import Foundation
+
+public final class MutexStats: @unchecked Sendable {
+    public enum Counter: Int, CaseIterable {
+        case lockFastHit            // initial CAS(0→1) at top of lock()
+        case lockSlowEntries        // entered lockContended()
+        case gateSkipsHit           // depth gate triggered — skip spin
+        case spinLoadsUnlocked      // load in spin saw state==unlocked
+        case spinExitedOnContended  // spin bailed on state==contended
+        case spinBudgetExhausted    // spin ran out of iterations
+        case spinCASFired           // in-spin CAS attempted (Optimal only)
+        case spinCASWon
+        case spinCASLost            // saw 0, CAS'd, another thread won
+        case postSpinCASFired       // post-spin CAS (Rust only)
+        case postSpinCASWon
+        case postSpinCASLost
+        case kernelPhaseEntries
+        case exchangeContendedWonFirstTry  // won on first exchange(2), never slept
+        case exchangeContendedWonAfterWait // woke from futex_wait, then won exchange
+        case futexWaitCalls
+        case futexWaitEAGAIN
+        case futexWaitInterrupted
+        case futexWakeCalls
+        case futexWakeSuppressed    // unlock saw word==contended but parkers==0
+        case demoteWonEmpty         // last parker out, CAS(contended→locked) won
+        case demoteLostRace         // last parker out, CAS failed (new parker entered)
+        case kernelSpinCASWon       // grabbed lock during pre-wait spin (saves a futex_wait)
+        case postWakeSawRelease     // post-wake load spin saw word==0 before budget exhausted
+    }
+
+    @usableFromInline let buf: UnsafeMutablePointer<UInt64>
+    @usableFromInline let count: Int
+
+    public init() {
+        count = Counter.allCases.count
+        buf = .allocate(capacity: count)
+        buf.initialize(repeating: 0, count: count)
+    }
+
+    deinit { buf.deallocate() }
+
+    @inlinable
+    public func incr(_ c: Counter) {
+        _ = atomic_fetch_add_u64_relaxed(buf.advanced(by: c.rawValue), 1)
+    }
+
+    public func snapshot() -> [(Counter, UInt64)] {
+        Counter.allCases.map { ($0, atomic_load_relaxed_u64(buf.advanced(by: $0.rawValue))) }
+    }
+
+    public func dump(label: String) {
+        var lines = ["--- \(label) ---"]
+        for (c, v) in snapshot() where v > 0 {
+            lines.append("  \(c): \(v)")
+        }
+        FileHandle.standardError.write(Data((lines.joined(separator: "\n") + "\n").utf8))
+    }
+}
+#endif

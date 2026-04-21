@@ -77,6 +77,7 @@ func longRunWorkload(
 
 let runSlow = ProcessInfo.processInfo.environment["MUTEX_BENCH_SLOW"] == "1"
 let runCopy = ProcessInfo.processInfo.environment["MUTEX_BENCH_COPY"] == "1"
+let runExperiment = ProcessInfo.processInfo.environment["MUTEX_BENCH_EXPERIMENT"] == "1"
 
 let benchmarks: @Sendable () -> Void = {
     // Entire target gated — 60s × 2 configs × 7 variants = ~14 min, and results
@@ -192,6 +193,36 @@ let benchmarks: @Sendable () -> Void = {
             let merged = mergeHistograms(hists)
             printLatencySummary("\(cfg.label) Optimal acquire-latency", merged)
             printFairnessSummary("\(cfg.label) Optimal per-task-acquires", counts: counts)
+        }
+
+        Benchmark("\(cfg.label) RustMutex") { benchmark in
+            let m = RustMutex(MapState(capacity: defaultMapCapacity))
+            benchmark.startMeasurement()
+            let (hists, counts) = await longRunWorkload(
+                tasks: cfg.tasks,
+                durationSeconds: cfg.durationSeconds,
+                work: cfg.work
+            ) { w, onAcq in m.withLock { onAcq(); $0.update(iterations: w) } }
+            benchmark.stopMeasurement()
+            let merged = mergeHistograms(hists)
+            printLatencySummary("\(cfg.label) RustMutex acquire-latency", merged)
+            printFairnessSummary("\(cfg.label) RustMutex per-task-acquires", counts: counts)
+        }
+
+        if runExperiment {
+            Benchmark("\(cfg.label) CLH") { benchmark in
+                let m = CLHMutex(MapState(capacity: defaultMapCapacity))
+                benchmark.startMeasurement()
+                let (hists, counts) = await longRunWorkload(
+                    tasks: cfg.tasks,
+                    durationSeconds: cfg.durationSeconds,
+                    work: cfg.work
+                ) { w, onAcq in m.withLock { onAcq(); $0.update(iterations: w) } }
+                benchmark.stopMeasurement()
+                let merged = mergeHistograms(hists)
+                printLatencySummary("\(cfg.label) CLH acquire-latency", merged)
+                printFairnessSummary("\(cfg.label) CLH per-task-acquires", counts: counts)
+            }
         }
 
         Benchmark("\(cfg.label) pthread_adaptive_np") { benchmark in

@@ -74,6 +74,7 @@ func burstyWorkload(
 
 let runSlow = ProcessInfo.processInfo.environment["MUTEX_BENCH_SLOW"] == "1"
 let runCopy = ProcessInfo.processInfo.environment["MUTEX_BENCH_COPY"] == "1"
+let runExperiment = ProcessInfo.processInfo.environment["MUTEX_BENCH_EXPERIMENT"] == "1"
 
 let benchmarks: @Sendable () -> Void = {
     // Entire target gated — results converged within 0.3% on 12C test host.
@@ -189,6 +190,36 @@ let benchmarks: @Sendable () -> Void = {
             benchmark.stopMeasurement()
             let merged = mergeHistograms(hists)
             printLatencySummary("\(cfg.label) Optimal first-of-burst", merged)
+        }
+
+        Benchmark("\(cfg.label) RustMutex") { benchmark in
+            let m = RustMutex(MapState(capacity: defaultMapCapacity))
+            benchmark.startMeasurement()
+            let hists = await burstyWorkload(
+                burstSize: cfg.burstSize,
+                bursts: cfg.bursts,
+                opsPerBurst: cfg.opsPerBurst,
+                quietMs: cfg.quietMs
+            ) { m.withLock { $0.update(iterations: 1) } }
+            benchmark.stopMeasurement()
+            let merged = mergeHistograms(hists)
+            printLatencySummary("\(cfg.label) RustMutex first-of-burst", merged)
+        }
+
+        if runExperiment {
+            Benchmark("\(cfg.label) CLH") { benchmark in
+                let m = CLHMutex(MapState(capacity: defaultMapCapacity))
+                benchmark.startMeasurement()
+                let hists = await burstyWorkload(
+                    burstSize: cfg.burstSize,
+                    bursts: cfg.bursts,
+                    opsPerBurst: cfg.opsPerBurst,
+                    quietMs: cfg.quietMs
+                ) { m.withLock { $0.update(iterations: 1) } }
+                benchmark.stopMeasurement()
+                let merged = mergeHistograms(hists)
+                printLatencySummary("\(cfg.label) CLH first-of-burst", merged)
+            }
         }
 
         Benchmark("\(cfg.label) pthread_adaptive_np") { benchmark in

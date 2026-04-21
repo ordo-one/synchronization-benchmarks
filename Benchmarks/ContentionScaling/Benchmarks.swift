@@ -5,7 +5,7 @@ import MutexBench
 // 192, 384 = Go-style oversubscription (4×, 8× on a 48C EPYC).
 // https://github.com/golang/go/blob/master/src/sync/mutex_test.go
 let configs: [BenchConfig] = {
-    let ts = BenchEnv.focus ? [1, 8, 32, 64, 96, 192, 384] : [1, 2, 4, 8, 16, 32, 64, 96, 192, 384]
+    let ts = BenchEnv.focus ? [1, 8, 20, 24, 32, 64, 96, 192, 384] : [1, 2, 4, 8, 16, 20, 22, 24, 32, 64, 96, 192, 384]
     return ts.map { BenchConfig(tasks: $0, work: 1) }
 }()
 

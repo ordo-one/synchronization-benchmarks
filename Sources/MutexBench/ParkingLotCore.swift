@@ -289,11 +289,19 @@ public enum ParkingLot {
         return Int(h &>> (64 - hashBits))
     }
 
-    /// Park the current thread on `addr`. `validate` is run under the bucket
-    /// lock after enqueue; if it returns false, abort without blocking.
-    /// `beforeSleep` runs after the bucket is unlocked, before the futex
-    /// wait — parking_lot uses this for deadlock detection hooks. Returns
-    /// `.unparked(token)` on wake, `.invalid` if validate rejected.
+    /// Park the current thread on `addr`. `validate` is run once as a cheap
+    /// pre-check (no bucket lock held), then again under the bucket lock
+    /// after enqueue setup; either failure returns `.invalid` without
+    /// blocking. `beforeSleep` runs after the bucket is unlocked, before
+    /// the futex wait — parking_lot uses this for deadlock detection hooks.
+    ///
+    /// Pre-validate (2026-04-20): bigdata Zen 4 INSTR showed ~30% of park
+    /// attempts at t≥32 abort via the in-lock validate. Each of those 17k
+    /// aborts per iter pays a bucketAcquire + bucketRelease. Checking
+    /// validate() first with a relaxed load costs one load and saves the
+    /// bucket-TTAS roundtrip for the entire race class. Correctness held
+    /// by the in-lock re-check: state may flip between pre-check and
+    /// bucketAcquire; the second validate catches that.
     public static func park(
         addr: UInt,
         validate: () -> Bool,
@@ -303,6 +311,12 @@ public enum ParkingLot {
         let idx = hash(addr)
         let b = bucketPointer(idx)
         let lp = bucketLockPointer(idx)
+
+        // Pre-validate — skip bucket entirely if the mutex state has already
+        // changed (caller will retry from top).
+        if !validate() {
+            return .invalid
+        }
 
         bucketAcquire(lp)
         if !validate() {
@@ -410,11 +424,13 @@ public enum ParkingLot {
 // MARK: - SpinWait
 
 // Exponential backoff matching parking_lot_core/spinwait.rs exactly.
-// Observed 2026-04-20: at oversubscription (t≥ core-count) the sched_yield
-// phase (iters 4-10) dominates cross-die coherence traffic — 2.75× collapse
-// on M1 Ultra, 7.25× on Broadwell 2-socket. Single-die Alder Lake immune.
 // Iter 1..=3 → 2^iter CPU pauses. Iter 4..=10 → sched_yield. Iter >10 →
 // `spin()` returns false, caller parks.
+//
+// 2026-04-20 note: extended pause phase (iters 1..=6) was tested on bigdata
+// Zen 4 — park-attempts barely moved (−1%), wall-clock unchanged. At CS=1ns
+// workloads, spin granularity exceeds unlocked-state window; longer spin
+// can't catch releases. Reverted to upstream 1..=3.
 @usableFromInline
 struct SpinWait {
     @usableFromInline var counter: UInt32 = 0

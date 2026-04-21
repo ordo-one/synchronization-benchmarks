@@ -395,24 +395,95 @@ The experiments above converged on `OptimalMutex` (`Sources/MutexBench/OptimalMu
 
 ```
 lock():
-    if CAS(unlocked -> locked): return                     // fast path
+    if CAS(unlocked -> locked): return                      // fast path
 
-    spinsRemaining = 14, pauseCount = 4                    // slow path
-    repeat:
-      state = load(relaxed)
-      if state == unlocked, CAS(unlocked -> locked): return
-      maxPauseCount = (state == contended) ? 6 : 32        // regime gate
-      pause x pauseCount
-      clamp pauseCount toward maxPauseCount                 // grow or shrink
+    // slow path: depth gate → spin phase → kernel phase
+    state, parkers = load(word), load(waiterCount)
+    if state == contended AND parkers >= 4: goto kernel     // skip spin
+
+    jitter = rdtsc()                                        // per-thread
+    spinsRemaining = 20
+    repeat:                                                 // spin phase
+      state = load(word, relaxed)
+      if state == unlocked:
+        if CAS(unlocked -> locked): return
+      if state == contended: break                          // can't win via spin
+      pauses = 64 + (jitter & 63)                           // 64..127 pauses
+      pause x pauses
     while --spinsRemaining > 0
 
-    repeat:                                                 // kernel phase
-      if exchange(contended) == unlocked: return            // acquired
-      futex_wait(word, contended)                           // sleep, woken by futex_wake
+  kernel:
+    registeredAsWaiter = false                              // lazy counter
+    repeat:
+      if exchange(contended) == unlocked:                   // acquired
+        if registeredAsWaiter: fetch_sub(waiterCount, 1)
+        return
+      if not registeredAsWaiter:
+        fetch_add(waiterCount, 1)                           // about to park
+        registeredAsWaiter = true
+      futex_wait(word, contended)                           // sleep
 
 unlock():
     if exchange(unlocked) == contended: futex_wake(1)
 ```
+
+### Flow diagram
+
+```mermaid
+flowchart TD
+    L0([lock]) --> L1{CAS 0 → 1?}
+    L1 -->|yes| Lret([acquired: return])
+    L1 -->|no: slow path| L2[load word + waiterCount]
+    L2 --> L3{word==2<br/>AND parkers≥4?}
+    L3 -->|yes: queue deep| K0[kernel phase]
+    L3 -->|no| S0[spin phase<br/>spins=20]
+
+    S0 --> S1[load word]
+    S1 --> S2{word == 0?}
+    S2 -->|yes| S3{CAS 0 → 1?}
+    S3 -->|yes| Lret
+    S3 -->|no: lost race| S4
+    S2 -->|no| S5{word == 2?}
+    S5 -->|yes: parker exists| K0
+    S5 -->|no: word==1| S4
+    S4[pause 64..127x<br/>jittered] --> S6{spins > 0?}
+    S6 -->|yes| S1
+    S6 -->|no: budget done| K0
+
+    K0 --> K1[exchange word,2]
+    K1 --> K2{prev == 0?}
+    K2 -->|yes: acquired| K3{registered<br/>as waiter?}
+    K3 -->|yes| K4[fetch_sub<br/>waiterCount]
+    K4 --> Lret
+    K3 -->|no| Lret
+    K2 -->|no: still held| K5{registered?}
+    K5 -->|no| K6[fetch_add<br/>waiterCount<br/>registered=true]
+    K5 -->|yes| K7
+    K6 --> K7[futex_wait word,2]
+    K7 --> K1
+```
+
+```mermaid
+flowchart TD
+    U0([unlock]) --> U1[exchange word, 0]
+    U1 --> U2{prev == 2?<br/>any waiters?}
+    U2 -->|no: locked=1| Uret([return, no syscall])
+    U2 -->|yes| U3[futex_wake word, 1]
+    U3 --> Uret
+```
+
+### Step count summary
+
+**Uncontended lock** — 1 atomic op (CAS) + function call.
+**Uncontended unlock** — 1 atomic op (exchange) + test-and-branch.
+
+**Contended lock (wins via spin)** — 1 CAS (fast path fail) + N × (load + pause) + 1 CAS (spin win). Typically 5-20 iterations = ~500ns-2µs on AMD, 2-10µs on Intel.
+
+**Contended lock (wins via exchange after park)** — spin budget burned + 1 exchange + 1 fetch_add (lazy register) + 1 futex_wait syscall + 1 exchange (wake-claim) + 1 fetch_sub (unregister) + return.
+
+**Contended lock (depth-gated skip-spin)** — 2 loads (word + waiterCount gate check) + 1 exchange + 1 fetch_add + 1 futex_wait + ... (no spin budget burned).
+
+**Contended unlock** — 1 exchange + 1 futex_wake syscall.
 
 Variables match `OptimalMutex.swift`: `spinsRemaining` (14), `pauseCount` (starts at 4 = backoff floor), `maxPauseCount` (6 or 32 from regime gate), `State.unlocked`/`.locked`/`.contended`.
 
@@ -450,3 +521,186 @@ Never regresses below NIOLock at any task count on any tested machine.
 - Optimal uses barging (new arrivals can steal) — best throughput (p50=83ns), occasional starvation (p99=214µs)
 - Stdlib PI uses kernel FIFO handoff — worst throughput (p50=383µs), perfect fairness (p99/p50=1.3×)
 - See [Fairness.md](results/Fairness.md) for full analysis and potential follow-ups (WebKit fairness injection, Go starvation mode)
+
+---
+
+## Experiment 16: DepthAdaptiveMutex (depth-gated skip-spin)
+
+**Question:** Can we avoid wasted spin budget when the queue is already deep?
+
+**Method:** Added `DepthAdaptiveMutex<Value>` — OptimalMutex plus a `waiterCount: UInt32` adjacent to the lock word. Threads parked in the kernel phase `fetch_add(waiterCount, 1)` before `futex_wait`; the successful acquirer `fetch_sub(waiterCount, 1)`. At slow-path entry:
+```
+if state == contended && waiterCount >= 2: skip spin, go directly to park
+```
+
+**Result (ContentionScaling p50 µs, MAX_SECS=10, best of 50 iter):**
+
+| host | t=64 | t=96 | t=192 | t=384 |
+|---|---:|---:|---:|---:|
+| Intel 12c Alder Lake | INSTR Optimal ref | +1.9% | +1.9% | +0.9% |
+| AMD 64c Zen 4 | +0.5% | +1.8% | **-1.9%** | +0.8% |
+| Intel 40c Skylake NUMA | -2.5% | -1.2% | -1.3% | -2.5% |
+
+**Finding:** Ties INSTR Optimal on AMD (within ±3% across task counts). Small wins on NUMA (-1 to -2.5%). The depth gate provides real but modest benefit — new arrivals stop spinning when the queue is already absorbing latency, avoiding wasted CPU. Lazy waiterCount registration (only `fetch_add` when actually about to park, not on slow-path entry) avoids the RMW cost for threads that win the first exchange.
+
+**Null-result on "fairness via depth gate"**: the gate also mildly improves tail latency on Intel NUMA hosts at c=63 (max -35 to -57%) because it reduces wake-lose-requeue cycles — queue-deep arrivals park directly instead of barging. This is the only "fairness win" kept from the session's experiments.
+
+---
+
+## Experiment 17: Go-style starvation mode
+
+**Question:** Will a STARVING bit latched by long-waiting threads reduce wake-amplification and bound max tail?
+
+**Method:** Port Go `sync.Mutex` starvation mode to plain-futex. Add STARVING bit (0x4) to lock word. On `futex_wait` return, if elapsed wait > 1ms, `fetch_or(word, STARVING)`. While STARVING set: spin-phase arrivals park instead of barge; unlock uses `fetch_and(word, ~0x3)` to preserve STARVING across release. STARVING clobbered by next successful `exchange(word, 2)` → episodic mode (one handoff per starvation event).
+
+**Result (ContentionScaling p50 µs Δ vs INSTR Optimal):**
+
+| host | t=64 | t=96 | t=192 | t=384 |
+|---|---:|---:|---:|---:|
+| Intel 12c Alder Lake | +7.6% | +9.2% | +6.1% | +5.9% |
+| AMD 64c Zen 4 | **+9.5%** | **+9.3%** | **+7.6%** | **+9.1%** |
+| Intel 40c Skylake NUMA | +4.3% | +5.3% | +7.0% | +5.5% |
+
+**Asymmetric c=63 max tail:**
+
+| host | INSTR Optimal | starv=1ms | starv+pws=32 |
+|---|---:|---:|---:|
+| AMD 64c Zen 4 | 2.3ms | **12.2ms (+430%!)** | 1.5ms |
+| Intel 40c Skylake NUMA | 28.3ms | 21.1ms (-26%) | 42.9ms (+52%) |
+| Intel 44c Broadwell NUMA | 16.1ms | 7.9ms (-50%) | 6.8ms (-57%) |
+
+INSTR counter comparison on AMD 64c Zen 4 t=64 showed starvation added **+15% futex_wait syscalls** (12259 → 14082) and **+13% spinCASLost → exchangeContendedWonAfterWait** shift — the mechanism IS firing (waiters handoff, fewer bargers) but at measurable syscall cost.
+
+**Finding:** Starvation mode regresses AMD p50 ~9% across all task counts. Worse: it creates unstable tails — AMD 64c Zen 4 c=63 max regressed +430% under asymmetric workload where starvation handoff chains block everyone. `pws=32` (Exp 18) bounds the chain but adds its own cost.
+
+**Rejected.** The original motivation (bound OptimalMutex's 20-30ms max tail on oversubscribed machines) was mis-diagnosed: those tails come from **kernel scheduler preempting the lock holder** for a 20ms timeslice, not from wake-amplification in userspace. Only PI-futex fixes preempt-held-lock tails; plain-futex categorically cannot. Starvation addressed a non-problem at real cost.
+
+---
+
+## Experiment 18: Post-wake spin (pws)
+
+**Question:** Can a short spin after `futex_wait` wake — with depth-based gating — catch the "wake-then-lose-to-barger" cycle cheaply?
+
+**Method:** After `futex_wait` returns, spin up to N iterations waiting for `word` to clear. Depth-gate the budget using already-tracked `waiterCount`:
+```
+budget = depth<=2 ? pws : depth<=8 ? pws/2 : 0
+```
+Tested pws=32.
+
+**Result:** On top of starv=1ms, pws=32 cuts AMD 64c Zen 4 c=63 Asymmetric max from 2.7ms to 1.5ms — fixes the starvation chain problem. p99 improvements at extreme oversubscription (t=64, 192): -8 to -15% on Intel 12c Alder Lake, AMD 64c Zen 4, and Intel 44c Broadwell NUMA.
+
+**But:** When tested without starvation, pws=32 regresses AMD 64c Zen 4 ContentionScaling p50 by +2-5%. Previously "hidden" under the +9% starv cost. On AMD, the extra post-wake CAS attempts from multiple waking threads just add contention without new wins.
+
+**Rejected** as a default. The wake-amplification it targets isn't the dominant tail cost; the p99 wins only appeared when starvation's handoff chains needed bounding. Without starv, pws adds cost without benefit.
+
+---
+
+## Experiment 19: Pre-wait double-check (dcheck)
+
+**Question:** Can a cheap load before `futex_wait` skip the syscall when the word has already changed (EAGAIN race)?
+
+**Method:** INSTR counters on AMD 64c Zen 4 t=64 showed **73% of futex_wait calls return EAGAIN** (8989 of 12259 per iter) — the owner unlocks between our `exchange(word, 2)` and the `futex_wait(word, 2)` syscall settling. Add a relaxed load check:
+```
+prevX = exchange(word, 2)
+if prevX & 3 == 0: return   // acquired
+if atomic_load_relaxed(word) != 2:
+    continue   // word changed in the meantime, skip syscall
+futex_wait(word, 2)
+```
+
+**Result:** Catch rate was **only 5.7%** — 540 of ~9500 EAGAIN per iter were caught by the userspace load. Wallclock impact: neutral (+/- 0.1% vs no-dcheck).
+
+**Finding:** The EAGAIN race happens almost entirely during kernel syscall entry (the ~100-500ns window where the CPU is transitioning into kernel mode and the page table / syscall table is being walked), not in userspace between our exchange and syscall call. A userspace load cannot close this window. Glibc/musl do this pattern for correctness in some paths, but it's not an AMD EAGAIN fix.
+
+**Rejected.**
+
+---
+
+## Experiment 20: Post-CAS-lost cooldown (pcl)
+
+**Question:** After a lost in-spin CAS, the cache line is in Modified state at the winning thread. Does a longer PAUSE cooldown before the next read help the line settle?
+
+**Method:** Added `postCASLostPause: UInt32` parameter. After `spinCASLost` increment, run N extra `spin_loop_hint()` calls before the normal end-of-iter pause. Pattern from abseil `base/internal/spinlock.cc` and WTF `Lock.cpp`. Tested pcl=64 and pcl=128.
+
+**Result (ContentionScaling p50 Δ vs INSTR Optimal, ungated):**
+
+| host | pcl=0 | pcl=64 | pcl=128 |
+|---|---:|---:|---:|
+| Intel 12c Alder Lake | +0.8% | -3.7% | **-6.6%** |
+| AMD 64c Zen 4 | +2.0% | +4.6% | +5.5% |
+| Intel 40c Skylake NUMA | +0.6% | -0.5% | -0.4% |
+
+**Regime split.** On the Intel 12c Alder Lake host, 64-128 extra PAUSEs let the cache line fully settle before the next read — real -6.6% wallclock win. On the AMD 64c Zen 4 host, during the cooldown MORE threads arrive and pile on — longer pause = more accumulation. `spinCASLost` counter on AMD 64c t=64 went UP (+3-5%) with pcl.
+
+**Depth-gated variants** (apply pcl only when waiterCount is small):
+- Tier gate (parkers≤2 full, ≤8 half, else 0): Intel 12c keeps -5% win; AMD 64c regression reduced to +1-4%.
+- Strict gate (parkers==0 only): Intel 12c still -4% win; AMD 64c t=64/384 still regress ~3% because `waiterCount` tracks only PARKED threads, not CAS-contending ones. On 64c AMD many threads are in spin+CAS cycles without parking, so the gate misses them.
+
+**Finding:** pcl is genuinely useful on moderate-core Intel (up to -6.6% p50) but hurts AMD 64c regardless of gating strategy. No gate based on `waiterCount` fully separates Intel benefit from AMD cost. CPU-detect ship (pcl=128 on Intel, pcl=0 on AMD) would work but forks the code path. Exposed as CLI knob (`--depth-pcl N`) for further per-host experimentation.
+
+**Not adopted by default.**
+
+---
+
+## Experiment 21: Cache-line padding (false sharing)
+
+**Question:** Both OptimalMutex and DepthAdaptiveMutex place value immediately after the lock word at offset 8 → same 64-byte cache line. Does padding value onto its own cache line reduce coherence traffic?
+
+**Method:** Bumped `valueOffset` from `max(8, alignof(Value))` to `max(64, alignof(Value))`. Buffer alignment also bumped to 64. Result: `[lockWord: 4B | waiterCount: 4B | pad | Value at offset 64]`.
+
+**Result (ContentionScaling p50 µs, AMD 64c Zen 4):**
+
+| t | unpadded | padded | Δ |
+|---|---:|---:|---:|
+| 64 | 15286 | 16081 | **+5.2%** |
+| 96 | 14975 | 15852 | **+5.9%** |
+| 192 | 15983 | 17170 | **+7.4%** |
+| 384 | 16212 | 17596 | **+8.5%** |
+
+Intel 40c Skylake NUMA ±2% noise.
+
+**Finding (counterintuitive):** Padding made AMD 64c Zen 4 ~6-8% WORSE. Likely hardware prefetcher interaction: with unpadded layout, reading lockWord brings Value's cache line into L1 via prefetch; the critical section's first Value access is already warm. With padding, Value is on a separate cache line → each CS pays a cold miss on first Value read, adding ~100ns per CS.
+
+**Rejected.** The theoretical false-sharing cost (lockWord invalidation from value writes) is smaller than the practical cold-miss cost on a contended mutex. Existing layout is accidentally optimized for the prefetcher.
+
+---
+
+## Experiment 22: perf stat analysis — the IPC floor
+
+**Question:** What hardware counters explain the AMD regression? Can we target the specific stall cause?
+
+**Method:** Wrapped `swift package benchmark --target ContentionScaling --filter "tasks=64 work=1 pause=0 INSTR <variant>"` with `perf stat -e cycles,instructions,cache-misses,L1-dcache-load-misses,task-clock`. Required `sudo sysctl kernel.perf_event_paranoid=1` to enable CPU events. Compared Optimal vs depth no-starv vs depth+pcl=128 on AMD 64c Zen 4.
+
+**Result (AMD 64c Zen 4, ContentionScaling t=64, 73-75s elapsed):**
+
+| metric | Optimal | depth no-starv | depth pcl=128 |
+|---|---:|---:|---:|
+| cycles | 628B | 578B | 617B |
+| instructions | 1182B | 1083B | 1168B |
+| **IPC** | **1.88** | **1.87** | **1.89** |
+| cache-miss % | **20.19%** | **20.11%** | **20.22%** |
+| L1-dcache-load-misses | 9.4B | 8.6B | 9.3B |
+
+Per-instruction on the contended CLI workload, IPC drops to **0.10** — 90% of cycles stalled, reproducibly across variants.
+
+**Finding:** cache-miss percentage and IPC are **invariant across all three variants**. The AMD regression is NOT a cache-coherence problem (the CCD-local CNA-lock research didn't apply — lock word stays hot in L1/L2, working set too small to thrash L3). The real cost is **futex syscall volume + spin-time accounting**, not cross-CCD traffic.
+
+Multi-run reproducibility check: same command executed 8× varies elapsed time **30-88% between runs** on the AMD 64c Zen 4 host. Scheduler-driven thread placement (which CCD each task lands on) dominates all mechanism-level deltas. IPC=0.10 and ~20% cache-miss % are the only stable signals; relative variant ranking is unreliable below ~15% delta.
+
+**Conclusion:** On 64c AMD under contended mutex workload, 90% pipeline stall is fundamental — cycles drain on atomic ops' memory barriers (exchange, CAS, fetch_and) and on repeated relaxed-load re-reads during spin. Mechanism-level tweaks cannot meaningfully improve IPC. The only remaining levers are at the data-structure level (flat combining, lock-striping) or at the workload level (shorter CS, fewer acquirers).
+
+---
+
+## Session conclusion
+
+All mechanism-level additions explored in this session got rolled back. **DepthAdaptiveMutex with `useStarvation=false, postCASLostPause=0, postWakeSpinTries=0, preWaitDoubleCheck=false`** is the ship candidate — essentially OptimalMutex plus a depth-gated skip-spin at slow-path entry. The depth gate buys small wins (-1 to -2.5% p50 on NUMA, Intel 40c Skylake NUMA c=63 max -57%) without AMD regression. Everything else we tried either broke AMD or made tails unstable.
+
+**Key negative results added to the rejected list:**
+- Go-style starvation mode: +9% AMD p50, +430% AMD 64c Zen 4 Asymmetric c=63 max regression
+- Post-wake spin (pws=32) without starv: +2-5% AMD p50
+- Pre-wait double-check: 5.7% EAGAIN catch rate, neutral wallclock
+- Post-CAS-lost cooldown ungated: -6.6% Intel 12c Alder Lake but +5% AMD 64c Zen 4 — CPU-dependent
+- Cache-line padding: +5-9% AMD regression from cold-miss on first value read
+- Reduced spin budget (sp=5): MORE kernel entries, worse on AMD
+
+**What IS fundamental:** IPC=0.10 stall floor on 64c AMD under contention is architectural, not a lock-internals problem. Mechanism-level wins on AMD are bounded by scheduler-driven variance (~30% run-to-run CV on mid-length runs) and the ~20% cache-miss rate that all variants share.

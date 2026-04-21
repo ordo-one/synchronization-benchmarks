@@ -1,17 +1,12 @@
 //===----------------------------------------------------------------------===//
-// OptimalMutex — Linux plain-futex mutex ported from Swift stdlib
-// Synchronization.Mutex PR (swiftlang/swift#88523, `_MutexHandle` in
-// stdlib/public/Synchronization/Mutex/LinuxImpl.swift).
+// OptimalMutexStats — instrumented twin of OptimalMutex.
 //
-// Variable names and comments mirror the upstream PR. The only differences:
-//   - CFutexShims replaces stdlib-internal `_SynchronizationShims.h`
-//     (`_swift_stdlib_futex_wait/wake`) and `Synchronization.Atomic`
-//     operations, neither of which is accessible outside the stdlib.
-//   - `fast_jitter()` replaces the `@_extern(c, "llvm.readcyclecounter")`
-//     intrinsic (unavailable in a user-level Swift package).
-//
-// Instrumented counterpart (for bench INSTR variants) lives in
-// OptimalMutexStats.swift. Keep this file algorithm-only.
+// Algorithm body mirrors OptimalMutex.swift 1:1 (which itself mirrors
+// swiftlang/swift#88523). The only additions are `MutexStats` counter
+// increments at every decision point, gated behind an optional `stats`
+// reference so a non-instrumented path stays zero-overhead — but in practice
+// this class is only constructed when a benchmark asks for INSTR counters.
+// If OptimalMutex is updated, apply the same edit here.
 //===----------------------------------------------------------------------===//
 
 #if os(Linux)
@@ -29,7 +24,7 @@ private let pauseBase: UInt32 = 64
 // without cache-line interference from the spinners.
 private let maxActiveSpinners: UInt32 = 4
 
-public final class OptimalMutex<Value>: @unchecked Sendable {
+public final class OptimalMutexStats<Value>: @unchecked Sendable {
     @usableFromInline
     enum State: UInt32 {
         case unlocked
@@ -38,19 +33,13 @@ public final class OptimalMutex<Value>: @unchecked Sendable {
     }
 
     @usableFromInline let buffer: UnsafeMutableRawPointer
-
-    // There are only 3 different values that storage can hold at a single time.
     @usableFromInline let storage: UnsafeMutablePointer<UInt32>
-
-    // Approximate count of threads currently in `_lockSlow`'s kernel phase. Read by the entry depth gate;
-    // inexact (e.g. counts briefly run between wake and retry), but used only as a hint.
     @usableFromInline let slowPathDepth: UnsafeMutablePointer<UInt32>
-
     @usableFromInline let valuePtr: UnsafeMutablePointer<Value>
+    public let stats: MutexStats
 
     public init(_ initialValue: Value) {
-        // Layout: [storage: UInt32 @0 | slowPathDepth: UInt32 @4 | padding | value]
-        // storage and slowPathDepth adjacent so the depth gate reads both from one line.
+        self.stats = MutexStats()
         let valueOffset = Swift.max(8, MemoryLayout<Value>.alignment)
         let totalSize = valueOffset + MemoryLayout<Value>.stride
         let alignment = Swift.max(
@@ -81,35 +70,23 @@ public final class OptimalMutex<Value>: @unchecked Sendable {
     @inlinable
     public func lock() {
         if atomic_cas_acquire_u32(storage, State.unlocked.rawValue, State.locked.rawValue) {
-            // Locked!
+            stats.incr(.lockFastHit)
             return
         }
-
         lockSlow(0)
     }
 
-    // Slow path for `_lock`:
-    //   - Depth gate: if the queue is already deep, skip straight to parking. Bounds tail latency and keeps the spinner
-    //     pool small so the owner's critical section runs uncontested.
-    //   - Spin: bounded pause-based spin with per-thread jitter. Stops early if the lock is observed contended, so we
-    //     don't steal it from a thread the kernel is about to wake.
-    //   - Kernel: loop try-acquire plus FUTEX_WAIT until acquired. A thread that has to park bumps `slowPathDepth` on
-    //     its first failed try-acquire and drops it on successful acquire. This feeds the depth gate: once enough
-    //     threads are parked, new arrivals skip spinning and park directly, which stops spinners from stealing the
-    //     lock out from under parked threads and bounds tail latency. Threads that win the initial try-acquire never
-    //     touch the counter.
-    //
-    // `selfId` is retained only to preserve the mangled ABI symbol from the prior PI-futex implementation.
     @usableFromInline
     func lockSlow(_ selfId: UInt32) {
-        // Skip the spin when the queue is already deep - extra spinners just slow down the parked threads' handoff.
+        stats.incr(.lockSlowEntries)
+
         let initialState = atomic_load_acquire_u32(storage)
         let depth = atomic_load_acquire_u32(slowPathDepth)
         let skipSpin = (initialState == State.contended.rawValue) && (depth >= maxActiveSpinners)
 
+        if skipSpin { stats.incr(.gateSkipsHit) }
+
         if !skipSpin {
-            // Cycle-counter low bits provide per-thread jitter to de-correlate pause timings across threads released
-            // together by a lock handoff.
             let jitter = fast_jitter()
             let mask = pauseBase &- 1
             var spinsRemaining = spinTries
@@ -117,18 +94,21 @@ public final class OptimalMutex<Value>: @unchecked Sendable {
             while spinsRemaining > 0 {
                 let state = atomic_load_relaxed_u32(storage)
 
-                if state == State.unlocked.rawValue,
-                   atomic_cas_acquire_u32(storage, State.unlocked.rawValue, State.locked.rawValue) {
-                    // Locked!
-                    return
+                if state == State.unlocked.rawValue {
+                    stats.incr(.spinLoadsUnlocked)
+                    stats.incr(.spinCASFired)
+                    if atomic_cas_acquire_u32(storage, State.unlocked.rawValue, State.locked.rawValue) {
+                        stats.incr(.spinCASWon)
+                        return
+                    }
+                    stats.incr(.spinCASLost)
                 }
 
-                // Don't steal the lock from a thread the kernel is about to wake.
-                if state == State.contended.rawValue { break }
+                if state == State.contended.rawValue {
+                    stats.incr(.spinExitedOnContended)
+                    break
+                }
 
-                // Inform the CPU that we're doing a spin loop which should have the
-                // effect of slowing down this loop if only by a little to preserve
-                // energy.
                 let pauses = pauseBase &+ (jitter & mask)
                 for _ in 0 ..< pauses {
                     spin_loop_hint()
@@ -136,35 +116,35 @@ public final class OptimalMutex<Value>: @unchecked Sendable {
 
                 spinsRemaining -= 1
             }
+
+            if spinsRemaining == 0 { stats.incr(.spinBudgetExhausted) }
         }
 
+        stats.incr(.kernelPhaseEntries)
         var visibleToSpinners = false
+        var firstTry = true
 
         while true {
-            // `.contended`, not `.locked`: parked threads exist and must be woken by the next unlock.
             if atomic_exchange_acquire_u32(storage, State.contended.rawValue) == State.unlocked.rawValue {
+                stats.incr(firstTry ? .exchangeContendedWonFirstTry : .exchangeContendedWonAfterWait)
                 if visibleToSpinners {
                     _ = atomic_fetch_sub_u32(slowPathDepth, 1)
                 }
-                // Locked!
                 return
             }
+            firstTry = false
 
-            // Didn't get the lock - either it's still held, or we were woken but a spinner / fast-path arrival got in first.
             if !visibleToSpinners {
-                // Make arriving threads park instead of spinning, so parked threads can make progress.
                 _ = atomic_fetch_add_u32(slowPathDepth, 1)
                 visibleToSpinners = true
             }
 
-            // Sleep while `*word == contended`. Returns 0 on a normal wake from FUTEX_WAKE, or an errno for retryable cases.
+            stats.incr(.futexWaitCalls)
             let waitResult = futex_wait(storage, State.contended.rawValue)
             switch waitResult {
-            // 0      - woken normally by FUTEX_WAKE from the unlocker
-            // EAGAIN - *word changed before the kernel-side comparison; retry
-            // EINTR  - signal-interrupted before sleep; retry
-            case 0, 11, 4:
-                continue
+            case 0: break
+            case 11: stats.incr(.futexWaitEAGAIN)
+            case 4: stats.incr(.futexWaitInterrupted)
             default:
                 fatalError("Unknown error occurred while attempting to acquire a Mutex: \(waitResult)")
             }
@@ -173,18 +153,15 @@ public final class OptimalMutex<Value>: @unchecked Sendable {
 
     @inlinable
     public func unlock() {
-        // If the previous value was `contended`, a waiter is parked in the kernel and we must wake one via FUTEX_WAKE.
         guard atomic_exchange_release_u32(storage, State.unlocked.rawValue) == State.contended.rawValue else {
-            // Unlocked, syscall-free (the common case).
             return
         }
-
         unlockSlow()
     }
 
     @usableFromInline
     func unlockSlow() {
-        // Wake exactly one parked waiter. Remaining parkers and newly-arriving spinners compete on the next release.
+        stats.incr(.futexWakeCalls)
         _ = futex_wake(storage, 1)
     }
 }

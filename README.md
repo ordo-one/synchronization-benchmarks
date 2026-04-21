@@ -1,4 +1,4 @@
-# mutex-bench
+# synchronization-bench
 
 Contention benchmark comparing Swift `Synchronization.Mutex` against `NIOLockedValueBox` (pthread_mutex) on Linux. Demonstrates a performance regression in Swift's stdlib Mutex under contention due to PI-futex (`FUTEX_LOCK_PI`) and an aggressive fixed userspace spin loop.
 
@@ -109,6 +109,7 @@ Ten `package-benchmark` targets, each testing a different axis of mutex behavior
 | ContentionRatio | Unlocked work between acquires | [Go mutex_test.go](https://github.com/golang/go/blob/master/src/sync/mutex_test.go), [folly SharedMutex](https://github.com/facebook/folly/blob/main/folly/test/SharedMutexTest.cpp) | [Results](results/ContentionRatio.md) |
 | NanosecondContention | ns-calibrated delay grid | [abseil BM_Contended](https://github.com/abseil/abseil-cpp/blob/master/absl/synchronization/mutex_benchmark.cc) | [Results](results/NanosecondContention.md) |
 | SpinTuning | Spin count x backoff cap grid | Original | [Experiments](Experiments.md) |
+| PthreadBench | pthread-based lock-bench compatibility matrix | [matklad/lock-bench](https://github.com/matklad/lock-bench) | Compatibility target |
 | Asymmetric | Producer/consumer fairness | [abseil BM_MutexEnqueue](https://github.com/abseil/abseil-cpp/blob/master/absl/synchronization/mutex_benchmark.cc) | [Fairness](results/Fairness.md) |
 | LongRun | 60s starvation probe with Gini metric | [Go starvation mode](https://github.com/golang/go/blob/master/src/sync/mutex.go), [WebKit unfairness](https://webkit.org/blog/6161/locking-in-webkit/) | [Results](results/LongRun.md) |
 | Bursty | Thundering-herd settling time | [glibc jitter](https://www.gnu.org/software/libc/manual/html_node/POSIX-Thread-Tunables.html), [WebKit burst detection](https://webkit.org/blog/6161/locking-in-webkit/) | [Results](results/Bursty.md) |
@@ -118,5 +119,3 @@ Ten `package-benchmark` targets, each testing a different axis of mutex behavior
 - [Fairness.md](results/Fairness.md) - per-acquire latency distributions, barging vs FIFO tradeoff
 - [Experiments.md](Experiments.md) - 15 experiments from PI-futex analysis to OptimalMutex
 - [SpinSurvey.md](SpinSurvey.md) - cross-ecosystem survey: WebKit, Rust, Go, glibc, Linux kernel
-- [CLI.md](CLI.md) - running benchmarks, environment variables
-- [RustComparison.md](RustComparison.md) - Rust std::sync::Mutex vs parking_lot cross-validation

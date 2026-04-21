@@ -32,6 +32,8 @@ public final class DepthAdaptiveMutex<Value>: @unchecked Sendable {
     public let postWakeSpinTries: Int
     public let useStarvation: Bool
     public let starvationThresholdNs: UInt64
+    public let preWaitDoubleCheck: Bool
+    public let postCASLostPause: UInt32
     public let stats: MutexStats?
 
     // STARVING bit (0x4): Go-style fairness mode. Latched by a waiter that
@@ -55,15 +57,27 @@ public final class DepthAdaptiveMutex<Value>: @unchecked Sendable {
         kernelSpinTries: Int = 0,
         postWakeSpinTries: Int = 0,
         useStarvation: Bool = false,
-        starvationThresholdNs: UInt64 = 1_000_000,  // 1ms, matches Go. Empirical: 1ms collapses W/P most on arnold at zero throughput cost.
+        starvationThresholdNs: UInt64 = 1_000_000,  // 1ms, matches Go. Empirical: 1ms collapses W/P most on x86 12c Alder Lake at zero throughput cost.
+        preWaitDoubleCheck: Bool = false,
+        postCASLostPause: UInt32 = 0,
         instrument: Bool = false
     ) {
         self.kernelSpinTries = kernelSpinTries
         self.postWakeSpinTries = postWakeSpinTries
         self.useStarvation = useStarvation
         self.starvationThresholdNs = starvationThresholdNs
+        self.preWaitDoubleCheck = preWaitDoubleCheck
+        self.postCASLostPause = postCASLostPause
         self.stats = instrument ? MutexStats() : nil
         // Layout: [word: UInt32 | counter: UInt32 | padding | value]
+        //
+        // Kept value adjacent to lockWord (not on a separate cache line).
+        // Tested 64-byte padding 2026-04-19 → regressed AMD 64c Zen 4 ~6-8% across
+        // all task counts. Hardware prefetcher brings value into L1 alongside
+        // lockWord on the first spin-read; padding breaks that win and each
+        // CS pays a cold miss on first value access. Theoretical false-sharing
+        // cost (lockWord invalidation from value writes) < practical cold-miss
+        // cost per CS.
         let valueOffset = Swift.max(8, MemoryLayout<Value>.alignment)
         let totalSize = valueOffset + MemoryLayout<Value>.stride
         let alignment = Swift.max(
@@ -107,10 +121,10 @@ public final class DepthAdaptiveMutex<Value>: @unchecked Sendable {
     @inlinable
     func lockSlow() {
         if let s = stats { s.incr(.lockSlowEntries) }
-        // Go-style starvation mode: if enabled, record entry time so we can
-        // latch STARVING bit after threshold elapses. Reading the clock here
-        // is cheap (vdso-backed clock_gettime) and only done on slow path.
-        let enterTime: UInt64 = useStarvation ? mutex_clock_ns() : 0
+        // Starvation entry-time is lazy: deferred until the first futex_wait
+        // call. Slow paths that resolve via spin or first exchange never pay
+        // the clock_gettime cost. 0 = not yet recorded.
+        var enterTime: UInt64 = 0
 
         // Advisory depth check: skip spin if queue deep OR lock in
         // starvation mode (new arrivals must queue, cannot barge).
@@ -138,6 +152,19 @@ public final class DepthAdaptiveMutex<Value>: @unchecked Sendable {
                         return
                     }
                     if let s = stats { s.incr(.spinCASLost) }
+                    // Post-CAS-lost cooldown: the cache line is in Modified
+                    // state at the winning thread's cache. Repeating our
+                    // relaxed load at full pace forces a second coherence
+                    // transition. Extra pause lets the line settle first.
+                    // Pattern per abseil spinlock.cc / WTF Lock.cpp.
+                    //
+                    // Depth-gated strict: only cooldown when queue is
+                    // empty. On high-core-count AMD, queue fills fast so
+                    // pcl never fires — zero cost. On low-count Intel,
+                    // queue often empty, pcl kicks in → cache settle win.
+                    if postCASLostPause > 0 && atomic_load_relaxed_u32(waiterCount) == 0 {
+                        for _ in 0..<postCASLostPause { spin_loop_hint() }
+                    }
                 }
                 // STARVING observed → must park. Contended state → park.
                 if (state & Self.STARVING) != 0 || (state & 0x3) == 2 {
@@ -159,8 +186,8 @@ public final class DepthAdaptiveMutex<Value>: @unchecked Sendable {
         // threshold. Avoids "sticky STARVING" that regressed p99 on sustained
         // mode (each acquire during the starving window pays gate+kernel cost).
         if let s = stats { s.incr(.kernelPhaseEntries) }
-        _ = atomic_fetch_add_u32(waiterCount, 1)
         var firstTry = true
+        var registeredAsWaiter = false
         while true {
             // exchange(word, 2) claims if prev word had locked bit clear:
             //   prev == 0 → normal unlock just happened, we win
@@ -171,10 +198,39 @@ public final class DepthAdaptiveMutex<Value>: @unchecked Sendable {
                 if let s = stats {
                     s.incr(firstTry ? .exchangeContendedWonFirstTry : .exchangeContendedWonAfterWait)
                 }
-                _ = atomic_fetch_sub_u32(waiterCount, 1)
+                if registeredAsWaiter {
+                    _ = atomic_fetch_sub_u32(waiterCount, 1)
+                }
                 return
             }
             firstTry = false
+
+            // Lazy waiter registration: only pay fetch_add if we're actually
+            // about to park. Slow paths that win the first exchange skip the
+            // waiterCount RMW entirely — big win on AMD where this counter's
+            // cache line contends with lockWord.
+            if !registeredAsWaiter {
+                _ = atomic_fetch_add_u32(waiterCount, 1)
+                registeredAsWaiter = true
+            }
+
+            // Record enter time just-in-time on first park. Any slow-path
+            // acquire that resolves via exchange never pays the clock read.
+            if useStarvation && enterTime == 0 {
+                enterTime = mutex_clock_ns()
+            }
+
+            // Pre-wait double-check: the futex_wait expected value is 2,
+            // but an owner unlock between our exchange(2) and the syscall
+            // flips word to 0 → kernel returns EAGAIN, wasted syscall.
+            // On AMD 64c t=64, ~73% of futex_wait calls return EAGAIN.
+            // A cheap relaxed load here catches most races before the
+            // syscall cost is paid. If word no longer == 2, skip wait
+            // and let the top of loop re-exchange to claim.
+            if preWaitDoubleCheck && atomic_load_relaxed_u32(word) != 2 {
+                if let s = stats { s.incr(.preWaitDoubleCheckSkipped) }
+                continue
+            }
 
             // Park. futex_wait expected=2 matches our exchange above.
             if let s = stats { s.incr(.futexWaitCalls) }
@@ -184,6 +240,24 @@ public final class DepthAdaptiveMutex<Value>: @unchecked Sendable {
             case 11: if let s = stats { s.incr(.futexWaitEAGAIN) }
             case 4: if let s = stats { s.incr(.futexWaitInterrupted) }
             default: fatalError("futex_wait: \(err)")
+            }
+
+            // Depth-gated post-wake spin. Uses waiterCount (already tracked)
+            // to skip extra spin on AMD/high-t where CAS contention already
+            // bottlenecks. Low depth → full budget. Medium → half. Deep → 0.
+            // Cheap observation path: if word reads free, fall through and
+            // let the top-of-loop exchange claim it without a second RMW.
+            if postWakeSpinTries > 0 {
+                let depth = atomic_load_relaxed_u32(waiterCount)
+                let budget = depth <= 2 ? postWakeSpinTries
+                           : depth <= 8 ? (postWakeSpinTries &>> 1)
+                           : 0
+                var i = 0
+                while i < budget {
+                    if (atomic_load_relaxed_u32(word) & 0x3) == 0 { break }
+                    spin_loop_hint()
+                    i &+= 1
+                }
             }
 
             // Post-wake: check our elapsed wait. If crossed threshold and

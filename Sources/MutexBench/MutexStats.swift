@@ -16,7 +16,22 @@
 import CFutexShims
 import Foundation
 
-public final class MutexStats: @unchecked Sendable {
+// Zero-cost stats dispatch: mutex classes are generic over `S: StatsSink`.
+// - `NoStats` has an empty `@inlinable` body → specializer folds every
+//   increment call to nothing at the call site. No null check, no icache cost.
+// - `MutexStats` is the real counter. Conformance gives `stats.incr(_:)` the
+//   same spelling in both paths.
+public protocol StatsSink {
+    func incr(_ c: MutexStats.Counter)
+}
+
+public struct NoStats: StatsSink, Sendable {
+    @inlinable public init() {}
+    @inlinable @inline(__always)
+    public func incr(_ c: MutexStats.Counter) {}
+}
+
+public final class MutexStats: StatsSink, @unchecked Sendable {
     public enum Counter: Int, CaseIterable {
         case lockFastHit            // initial CAS(0→1) at top of lock()
         case lockSlowEntries        // entered lockContended()
@@ -42,6 +57,18 @@ public final class MutexStats: @unchecked Sendable {
         case demoteLostRace         // last parker out, CAS failed (new parker entered)
         case kernelSpinCASWon       // grabbed lock during pre-wait spin (saves a futex_wait)
         case postWakeSawRelease     // post-wake load spin saw word==0 before budget exhausted
+        case preWaitDoubleCheckSkipped // pre-wait load saw word != 2, skipped futex_wait syscall
+        // parking_lot-specific
+        case spinPauseIters         // SpinWait iter 1..=3 fired (CPU-pause phase)
+        case spinYieldIters         // SpinWait iter 4..=10 fired (sched_yield phase) — collapse suspect
+        case spinWaitExhausted      // SpinWait returned false → park
+        case parkAttempts           // called ParkingLot.park()
+        case parkInvalidRace        // validate() returned false — race with unlock
+        case handoffReceived        // woken with TOKEN_HANDOFF (fair unlock handed the lock)
+        case fairUnparkTriggered    // unparkOne saw beFair=true
+        case unparkEmpty            // unparkOne found no waiter (race)
+        case unparkFoundWaiter      // unparkOne woke one
+        case unparkHaveMoreThreads  // queue still has entries after unpark
     }
 
     @usableFromInline let buf: UnsafeMutablePointer<UInt64>

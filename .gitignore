@@ -19,6 +19,11 @@ rsync.sh
 collect-results.sh
 run-remote.sh
 
+# Local-only scripts and comparison harnesses — not part of the shipped
+# surface. Outputs from these scripts already land in results/*.md.
+scripts/
+comparison/
+
 # Local-only CLI (not published)
 Sources/Mutex/
 CLI.md
@@ -26,3 +31,24 @@ Package.internal.swift
 
 # Rust comparison build output
 comparison/rust/target/
+
+# Vendored upstream parking_lot (reference source for the Swift port; not
+# shipped — local-only check-out, license already respected in the Swift port).
+parking_lot/
+
+# Python bytecode cache
+__pycache__/
+*.pyc
+
+# Local agent / editor state
+.claude/
+CLAUDE.md
+
+# Local dev scratch + lock
+TODO.md
+Package.resolved
+
+# Raw bench output files — filename + contents embed `hostname -s` from the
+# machine they ran on. Only the curated results/*.md docs ship; raw .txt logs
+# stay local to each dev machine.
+results/*.txt

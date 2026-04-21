@@ -166,7 +166,7 @@ static inline uint32_t atomic_exchange_release_u32(uint32_t *addr, uint32_t val)
     return __atomic_exchange_n(addr, val, __ATOMIC_RELEASE);
 }
 
-// --- Atomic pointer ops (for MCS queue and similar) ---
+// --- Atomic pointer ops (used by queue-lock experiments archived in Internal/) ---
 
 static inline void *atomic_load_relaxed_ptr(void **addr) {
     return __atomic_load_n(addr, __ATOMIC_RELAXED);

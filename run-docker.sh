@@ -32,8 +32,15 @@ IMAGE="mutex-bench"
 MEMORY="8G"
 BENCH_DIR="$(cd "$(dirname "$0")" && pwd)"
 
-# Parse first arg as core matrix if it looks like numbers
-CORES="1,2,4,8,16"
+# Default to (host cores - 2) so the bench doesn't fight the host/runtime for CPU.
+# Override by passing a comma-separated matrix as the first arg.
+if [ "$(uname)" = "Darwin" ]; then
+    HOST_CORES=$(sysctl -n hw.ncpu)
+else
+    HOST_CORES=$(nproc)
+fi
+DEFAULT_CORES=$(( HOST_CORES > 2 ? HOST_CORES - 2 : HOST_CORES ))
+CORES="$DEFAULT_CORES"
 BENCH_ARGS=()
 if [ $# -gt 0 ]; then
     if [[ "$1" =~ ^[0-9,]+$ ]]; then

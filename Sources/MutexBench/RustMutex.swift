@@ -37,12 +37,15 @@
 // skipSpuriousWake, or demoteOnEmpty is enabled. Base Rust variant
 // (all off) is unperturbed.
 //
+// Stats instrumentation dispatched via generic `S: StatsSink`. Default
+// `NoStats` has an empty inlined `incr` → specializer erases every counter
+// call. Construct with `stats: MutexStats()` for INSTR runs.
 //===----------------------------------------------------------------------===//
 
 #if os(Linux)
 import CFutexShims
 
-public final class RustMutex<Value>: @unchecked Sendable {
+public final class RustMutex<Value, S: StatsSink>: @unchecked Sendable {
     @usableFromInline
     enum State: UInt32 {
         case unlocked
@@ -64,7 +67,7 @@ public final class RustMutex<Value>: @unchecked Sendable {
     public let depthThreshold: UInt32
     public let skipSpuriousWake: Bool
     public let demoteOnEmpty: Bool
-    public let stats: MutexStats?
+    public let stats: S
 
     @usableFromInline
     var tracksParkers: Bool {
@@ -73,6 +76,7 @@ public final class RustMutex<Value>: @unchecked Sendable {
 
     public init(
         _ initialValue: Value,
+        stats: S,
         spinTries: Int = 100,
         pausesPerIter: UInt32 = 1,
         outerRetries: Int = 0,
@@ -80,8 +84,7 @@ public final class RustMutex<Value>: @unchecked Sendable {
         spinIfLimited: Bool = false,
         depthThreshold: UInt32 = 0,
         skipSpuriousWake: Bool = false,
-        demoteOnEmpty: Bool = false,
-        instrument: Bool = false
+        demoteOnEmpty: Bool = false
     ) {
         self.spinTries = spinTries
         self.pausesPerIter = pausesPerIter
@@ -91,7 +94,7 @@ public final class RustMutex<Value>: @unchecked Sendable {
         self.depthThreshold = depthThreshold
         self.skipSpuriousWake = skipSpuriousWake
         self.demoteOnEmpty = demoteOnEmpty
-        self.stats = instrument ? MutexStats() : nil
+        self.stats = stats
 
         // Layout: [word:u32 @0 | activeRetriers:u32 @4 | parkers:u32 @8 | padding | value]
         // Header is 12 bytes; all three counters on the same cache line so the
@@ -130,7 +133,7 @@ public final class RustMutex<Value>: @unchecked Sendable {
     @inlinable
     public func lock() {
         if atomic_cas_acquire_u32(word, State.unlocked.rawValue, State.locked.rawValue) {
-            if let s = stats { s.incr(.lockFastHit) }
+            stats.incr(.lockFastHit)
             return
         }
         lockContended()
@@ -138,7 +141,7 @@ public final class RustMutex<Value>: @unchecked Sendable {
 
     @inlinable
     func lockContended() {
-        if let s = stats { s.incr(.lockSlowEntries) }
+        stats.incr(.lockSlowEntries)
         // Depth-adaptive gate (OptimalMutex #8). When enabled, skip spin +
         // retries if the queue is already deep — go straight to park.
         let skipSpin = depthThreshold > 0
@@ -147,27 +150,25 @@ public final class RustMutex<Value>: @unchecked Sendable {
 
         var state: UInt32 = State.unlocked.rawValue
         if skipSpin {
-            if let s = stats { s.incr(.gateSkipsHit) }
+            stats.incr(.gateSkipsHit)
             // Fall through to kernel phase. state=unlocked so first loop
             // iteration does `exchange(contended)` — if owner released in
             // the gap we win; otherwise park.
         } else {
             state = spin()
             if state == State.unlocked.rawValue {
-                if let s = stats {
-                    s.incr(.spinLoadsUnlocked)
-                    s.incr(.postSpinCASFired)
-                }
+                stats.incr(.spinLoadsUnlocked)
+                stats.incr(.postSpinCASFired)
                 if atomic_cas_acquire_u32(word, State.unlocked.rawValue, State.locked.rawValue) {
-                    if let s = stats { s.incr(.postSpinCASWon) }
+                    stats.incr(.postSpinCASWon)
                     return
                 }
-                if let s = stats { s.incr(.postSpinCASLost) }
+                stats.incr(.postSpinCASLost)
                 state = atomic_load_relaxed_u32(word)
             } else if state == State.contended.rawValue {
-                if let s = stats { s.incr(.spinExitedOnContended) }
+                stats.incr(.spinExitedOnContended)
             } else {
-                if let s = stats { s.incr(.spinBudgetExhausted) }
+                stats.incr(.spinBudgetExhausted)
             }
         }
 
@@ -212,16 +213,14 @@ public final class RustMutex<Value>: @unchecked Sendable {
         }
 
         // Kernel phase: swap to CONTENDED (acquire attempt 2) or park.
-        if let s = stats { s.incr(.kernelPhaseEntries) }
+        stats.incr(.kernelPhaseEntries)
         let tracks = tracksParkers
         if tracks { _ = atomic_fetch_add_u32(parkers, 1) }
         var firstTry = true
         while true {
             if state != State.contended.rawValue
                 && atomic_exchange_acquire_u32(word, State.contended.rawValue) == State.unlocked.rawValue {
-                if let s = stats {
-                    s.incr(firstTry ? .exchangeContendedWonFirstTry : .exchangeContendedWonAfterWait)
-                }
+                stats.incr(firstTry ? .exchangeContendedWonFirstTry : .exchangeContendedWonAfterWait)
                 if tracks {
                     let prev = atomic_fetch_sub_u32(parkers, 1)
                     // Demote word 2→1 if we're the last parker out. Lets
@@ -229,9 +228,9 @@ public final class RustMutex<Value>: @unchecked Sendable {
                     // CAS(0→1) for the next uncontended arriver.
                     if demoteOnEmpty && prev == 1 {
                         if atomic_cas_acquire_u32(word, State.contended.rawValue, State.locked.rawValue) {
-                            if let s = stats { s.incr(.demoteWonEmpty) }
+                            stats.incr(.demoteWonEmpty)
                         } else {
-                            if let s = stats { s.incr(.demoteLostRace) }
+                            stats.incr(.demoteLostRace)
                         }
                     }
                 }
@@ -239,12 +238,12 @@ public final class RustMutex<Value>: @unchecked Sendable {
             }
             firstTry = false
 
-            if let s = stats { s.incr(.futexWaitCalls) }
+            stats.incr(.futexWaitCalls)
             let err = futex_wait(word, State.contended.rawValue)
             switch err {
             case 0: break
-            case 11: if let s = stats { s.incr(.futexWaitEAGAIN) }
-            case 4: if let s = stats { s.incr(.futexWaitInterrupted) }
+            case 11: stats.incr(.futexWaitEAGAIN)
+            case 4: stats.incr(.futexWaitInterrupted)
             default: fatalError("Unknown error in futex_wait: \(err)")
             }
 
@@ -274,11 +273,38 @@ public final class RustMutex<Value>: @unchecked Sendable {
         // can be stale (e.g. kernel-phase winner stamped word=2, grabbed
         // lock, then everyone drained before unlock).
         if skipSpuriousWake && atomic_load_relaxed_u32(parkers) == 0 {
-            if let s = stats { s.incr(.futexWakeSuppressed) }
+            stats.incr(.futexWakeSuppressed)
             return
         }
-        if let s = stats { s.incr(.futexWakeCalls) }
+        stats.incr(.futexWakeCalls)
         _ = futex_wake(word, 1)
+    }
+}
+
+extension RustMutex where S == NoStats {
+    public convenience init(
+        _ initialValue: Value,
+        spinTries: Int = 100,
+        pausesPerIter: UInt32 = 1,
+        outerRetries: Int = 0,
+        retrierLimit: UInt32 = 0,
+        spinIfLimited: Bool = false,
+        depthThreshold: UInt32 = 0,
+        skipSpuriousWake: Bool = false,
+        demoteOnEmpty: Bool = false
+    ) {
+        self.init(
+            initialValue,
+            stats: NoStats(),
+            spinTries: spinTries,
+            pausesPerIter: pausesPerIter,
+            outerRetries: outerRetries,
+            retrierLimit: retrierLimit,
+            spinIfLimited: spinIfLimited,
+            depthThreshold: depthThreshold,
+            skipSpuriousWake: skipSpuriousWake,
+            demoteOnEmpty: demoteOnEmpty
+        )
     }
 }
 #endif

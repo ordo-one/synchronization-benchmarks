@@ -1,10 +1,5 @@
 import Benchmark
-import Foundation
 import MutexBench
-
-let maxDurationSecs = Int(ProcessInfo.processInfo.environment["MUTEX_BENCH_MAX_SECS"] ?? "") ?? 20
-let runSlow = ProcessInfo.processInfo.environment["MUTEX_BENCH_SLOW"] == "1"
-let runCopy = ProcessInfo.processInfo.environment["MUTEX_BENCH_COPY"] == "1"
 
 // Sweeps protected-state size through L1 → L2 → L3 → DRAM at fixed high
 // contention. Random-key access inside the lock defeats the HW prefetcher,
@@ -38,91 +33,22 @@ let wsCases: [WSCase] = [
 ]
 
 let benchmarks: @Sendable () -> Void = {
-    Benchmark.defaultConfiguration = .init(
-        metrics: [.wallClock, .cpuUser, .cpuSystem, .throughput, .syscalls, .contextSwitches, .threadsRunning, .instructions],
-        timeUnits: .microseconds,
+    BenchEnv.applyDefaultConfig(
         warmupIterations: 10,
-        maxDuration: .seconds(maxDurationSecs),
+        maxDurationSecs: BenchEnv.maxSecs(default: 20),
         maxIterations: 100
     )
 
     for c in wsCases {
-        Benchmark("\(c.label) Synchronization.Mutex") { benchmark in
-            let box = SyncMutexBox(capacity: c.capacity)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: c.tasks, acquiresPerTask: c.acquiresPerTask) {
-                box.m.withLock { $0.updateRandom(iterations: c.work) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(c.label) NIOLockedValueBox") { benchmark in
-            let box = NIOLockBox(capacity: c.capacity)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: c.tasks, acquiresPerTask: c.acquiresPerTask) {
-                box.box.withLockedValue { $0.updateRandom(iterations: c.work) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        #if os(Linux)
-        if runCopy {
-            Benchmark("\(c.label) Synchronization.Mutex (copy)") { benchmark in
-                let m = SynchronizationMutex(MapState(capacity: c.capacity))
+        for v in StandardVariants.defaultsWithRust() {
+            Benchmark("\(c.label) \(v.name)") { benchmark in
+                let h = v.make(c.capacity)
                 benchmark.startMeasurement()
                 await runWorkload(tasks: c.tasks, acquiresPerTask: c.acquiresPerTask) {
-                    m.withLock { $0.updateRandom(iterations: c.work) }
+                    h.runLocked { $0.updateRandom(iterations: c.work) }
                 }
                 benchmark.stopMeasurement()
             }
         }
-
-        Benchmark("\(c.label) PlainFutexMutex (spin=100)") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: c.capacity), spinTries: 100)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: c.tasks, acquiresPerTask: c.acquiresPerTask) {
-                m.withLock { $0.updateRandom(iterations: c.work) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(c.label) plain spin=14 backoff") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: c.capacity), spinTries: 14, useBackoff: true)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: c.tasks, acquiresPerTask: c.acquiresPerTask) {
-                m.withLock { $0.updateRandom(iterations: c.work) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(c.label) plain spin=40 fixed") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: c.capacity), spinTries: 40)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: c.tasks, acquiresPerTask: c.acquiresPerTask) {
-                m.withLock { $0.updateRandom(iterations: c.work) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(c.label) Optimal") { benchmark in
-            let m = OptimalMutex(MapState(capacity: c.capacity))
-            benchmark.startMeasurement()
-            await runWorkload(tasks: c.tasks, acquiresPerTask: c.acquiresPerTask) {
-                m.withLock { $0.updateRandom(iterations: c.work) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        if runSlow {
-            Benchmark("\(c.label) pthread_adaptive_np") { benchmark in
-                let m = AdaptiveMutex(MapState(capacity: c.capacity))
-                benchmark.startMeasurement()
-                await runWorkload(tasks: c.tasks, acquiresPerTask: c.acquiresPerTask) {
-                    m.withLock { $0.updateRandom(iterations: c.work) }
-                }
-                benchmark.stopMeasurement()
-            }
-        }
-        #endif
     }
 }

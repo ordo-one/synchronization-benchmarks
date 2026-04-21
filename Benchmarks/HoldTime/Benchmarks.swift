@@ -2,17 +2,13 @@ import Benchmark
 import Foundation
 import MutexBench
 
-let maxDurationSecs = Int(ProcessInfo.processInfo.environment["MUTEX_BENCH_MAX_SECS"] ?? "") ?? 15
-
 // Main sweep: uniform hold-time axis at fixed tasks=16.
 // work=0 is the empty-CS floor (pure lock/unlock overhead).
 //   See: https://matklad.github.io/2020/01/04/mutexes-are-faster-than-spinlocks.html
 //        https://webkit.org/blog/6161/locking-in-webkit/ — LockSpeedTest worksInsideLock=0
-let runSlow = ProcessInfo.processInfo.environment["MUTEX_BENCH_SLOW"] == "1"
-let runCopy = ProcessInfo.processInfo.environment["MUTEX_BENCH_COPY"] == "1"
 let fastWork = [0, 1, 16, 64, 128]
 let slowWork = [256, 1024]
-let configs = (fastWork + (runSlow ? slowWork : [])).map { BenchConfig(tasks: 16, work: $0) }
+let configs = (fastWork + (BenchEnv.slow ? slowWork : [])).map { BenchConfig(tasks: 16, work: $0) }
 
 // Bimodal hold-time: short path most of the time, long path rarely.
 // Tests whether fixed-spin budgets match the median (short) or the mean (skewed).
@@ -36,8 +32,7 @@ let bimodalConfigs: [BimodalConfig] = [
 // Sleep-inside-lock: holder blocks in kernel rather than burning CPU.
 // Forces every waiter through the kernel-wait path and, for PI-futex,
 // through the rt_mutex PI-chain walk — different regime from CPU-busy holds.
-// Adapted from https://github.com/cuongleqq/mutex-benches LongHold scenario
-// (thread::sleep inside the lock; default hold_us=200).
+// Adapted from https://github.com/cuongleqq/mutex-benches LongHold scenario.
 struct SleepHoldConfig: Sendable {
     let tasks: Int
     let holdUs: UInt32
@@ -72,135 +67,33 @@ func bimodalBody(
 }
 
 let benchmarks: @Sendable () -> Void = {
-    Benchmark.defaultConfiguration = .init(
-        metrics: [.wallClock, .cpuUser, .cpuSystem, .throughput, .syscalls, .contextSwitches, .threadsRunning, .instructions],
-        timeUnits: .microseconds,
+    BenchEnv.applyDefaultConfig(
         warmupIterations: 3,
-        maxDuration: .seconds(maxDurationSecs),
+        maxDurationSecs: BenchEnv.maxSecs(default: 15),
         maxIterations: 50
     )
 
+    let variants = StandardVariants.defaultsWithRust()
+
+    // Uniform hold-time sweep.
     for cfg in configs {
-        Benchmark("\(cfg.label) Synchronization.Mutex") { benchmark in
-            let box = SyncMutexBox(capacity: defaultMapCapacity)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) { box.work(cfg.work) }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(cfg.label) NIOLockedValueBox") { benchmark in
-            let box = NIOLockBox(capacity: defaultMapCapacity)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) { box.work(cfg.work) }
-            benchmark.stopMeasurement()
-        }
-
-        #if os(Linux)
-        if runCopy {
-            Benchmark("\(cfg.label) Synchronization.Mutex (copy)") { benchmark in
-                let m = SynchronizationMutex(MapState(capacity: defaultMapCapacity))
+        for v in variants {
+            Benchmark("\(cfg.label) \(v.name)") { benchmark in
+                let h = v.make(defaultMapCapacity)
                 benchmark.startMeasurement()
                 await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                    m.withLock { $0.update(iterations: cfg.work) }
+                    h.runLocked { $0.update(iterations: cfg.work) }
                 }
                 benchmark.stopMeasurement()
             }
         }
-
-        Benchmark("\(cfg.label) PlainFutexMutex (spin=100)") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: defaultMapCapacity), spinTries: 100)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                m.withLock { $0.update(iterations: cfg.work) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(cfg.label) plain spin=14 backoff") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: defaultMapCapacity), spinTries: 14, useBackoff: true)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                m.withLock { $0.update(iterations: cfg.work) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(cfg.label) plain spin=40 fixed") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: defaultMapCapacity), spinTries: 40)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                m.withLock { $0.update(iterations: cfg.work) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(cfg.label) Optimal") { benchmark in
-            let m = OptimalMutex(MapState(capacity: defaultMapCapacity))
-            benchmark.startMeasurement()
-            await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                m.withLock { $0.update(iterations: cfg.work) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        if runSlow {
-            Benchmark("\(cfg.label) pthread_adaptive_np") { benchmark in
-                let m = AdaptiveMutex(MapState(capacity: defaultMapCapacity))
-                benchmark.startMeasurement()
-                await runWorkload(tasks: cfg.tasks, acquiresPerTask: cfg.acquiresPerTask) {
-                    m.withLock { $0.update(iterations: cfg.work) }
-                }
-                benchmark.stopMeasurement()
-            }
-        }
-        #endif
     }
 
+    // Bimodal hold-time.
     for bc in bimodalConfigs {
-        Benchmark("\(bc.label) Synchronization.Mutex") { benchmark in
-            let box = SyncMutexBox(capacity: defaultMapCapacity)
-            benchmark.startMeasurement()
-            await withTaskGroup(of: Void.self) { group in
-                for t in 0..<bc.tasks {
-                    let seed = UInt64(t + 1) &* 0x9E37_79B9_7F4A_7C15
-                    group.addTask {
-                        bimodalBody(
-                            acquiresPerTask: bc.acquiresPerTask,
-                            taskSeed: seed,
-                            shortWork: bc.shortWork,
-                            longWork: bc.longWork,
-                            longProbPct: bc.longProbPct
-                        ) { w in box.work(w) }
-                    }
-                }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(bc.label) NIOLockedValueBox") { benchmark in
-            let box = NIOLockBox(capacity: defaultMapCapacity)
-            benchmark.startMeasurement()
-            await withTaskGroup(of: Void.self) { group in
-                for t in 0..<bc.tasks {
-                    let seed = UInt64(t + 1) &* 0x9E37_79B9_7F4A_7C15
-                    group.addTask {
-                        bimodalBody(
-                            acquiresPerTask: bc.acquiresPerTask,
-                            taskSeed: seed,
-                            shortWork: bc.shortWork,
-                            longWork: bc.longWork,
-                            longProbPct: bc.longProbPct
-                        ) { w in box.work(w) }
-                    }
-                }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        #if os(Linux)
-        if runCopy {
-            Benchmark("\(bc.label) Synchronization.Mutex (copy)") { benchmark in
-                let m = SynchronizationMutex(MapState(capacity: defaultMapCapacity))
+        for v in variants {
+            Benchmark("\(bc.label) \(v.name)") { benchmark in
+                let h = v.make(defaultMapCapacity)
                 benchmark.startMeasurement()
                 await withTaskGroup(of: Void.self) { group in
                     for t in 0..<bc.tasks {
@@ -212,197 +105,27 @@ let benchmarks: @Sendable () -> Void = {
                                 shortWork: bc.shortWork,
                                 longWork: bc.longWork,
                                 longProbPct: bc.longProbPct
-                            ) { w in m.withLock { $0.update(iterations: w) } }
+                            ) { w in h.runLocked { $0.update(iterations: w) } }
                         }
                     }
                 }
                 benchmark.stopMeasurement()
             }
         }
-
-        Benchmark("\(bc.label) PlainFutexMutex (spin=100)") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: defaultMapCapacity), spinTries: 100)
-            benchmark.startMeasurement()
-            await withTaskGroup(of: Void.self) { group in
-                for t in 0..<bc.tasks {
-                    let seed = UInt64(t + 1) &* 0x9E37_79B9_7F4A_7C15
-                    group.addTask {
-                        bimodalBody(
-                            acquiresPerTask: bc.acquiresPerTask,
-                            taskSeed: seed,
-                            shortWork: bc.shortWork,
-                            longWork: bc.longWork,
-                            longProbPct: bc.longProbPct
-                        ) { w in m.withLock { $0.update(iterations: w) } }
-                    }
-                }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(bc.label) plain spin=14 backoff") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: defaultMapCapacity), spinTries: 14, useBackoff: true)
-            benchmark.startMeasurement()
-            await withTaskGroup(of: Void.self) { group in
-                for t in 0..<bc.tasks {
-                    let seed = UInt64(t + 1) &* 0x9E37_79B9_7F4A_7C15
-                    group.addTask {
-                        bimodalBody(
-                            acquiresPerTask: bc.acquiresPerTask,
-                            taskSeed: seed,
-                            shortWork: bc.shortWork,
-                            longWork: bc.longWork,
-                            longProbPct: bc.longProbPct
-                        ) { w in m.withLock { $0.update(iterations: w) } }
-                    }
-                }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(bc.label) plain spin=40 fixed") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: defaultMapCapacity), spinTries: 40)
-            benchmark.startMeasurement()
-            await withTaskGroup(of: Void.self) { group in
-                for t in 0..<bc.tasks {
-                    let seed = UInt64(t + 1) &* 0x9E37_79B9_7F4A_7C15
-                    group.addTask {
-                        bimodalBody(
-                            acquiresPerTask: bc.acquiresPerTask,
-                            taskSeed: seed,
-                            shortWork: bc.shortWork,
-                            longWork: bc.longWork,
-                            longProbPct: bc.longProbPct
-                        ) { w in m.withLock { $0.update(iterations: w) } }
-                    }
-                }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(bc.label) Optimal") { benchmark in
-            let m = OptimalMutex(MapState(capacity: defaultMapCapacity))
-            benchmark.startMeasurement()
-            await withTaskGroup(of: Void.self) { group in
-                for t in 0..<bc.tasks {
-                    let seed = UInt64(t + 1) &* 0x9E37_79B9_7F4A_7C15
-                    group.addTask {
-                        bimodalBody(
-                            acquiresPerTask: bc.acquiresPerTask,
-                            taskSeed: seed,
-                            shortWork: bc.shortWork,
-                            longWork: bc.longWork,
-                            longProbPct: bc.longProbPct
-                        ) { w in m.withLock { $0.update(iterations: w) } }
-                    }
-                }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        if runSlow {
-            Benchmark("\(bc.label) pthread_adaptive_np") { benchmark in
-                let m = AdaptiveMutex(MapState(capacity: defaultMapCapacity))
-                benchmark.startMeasurement()
-                await withTaskGroup(of: Void.self) { group in
-                    for t in 0..<bc.tasks {
-                        let seed = UInt64(t + 1) &* 0x9E37_79B9_7F4A_7C15
-                        group.addTask {
-                            bimodalBody(
-                                acquiresPerTask: bc.acquiresPerTask,
-                                taskSeed: seed,
-                                shortWork: bc.shortWork,
-                                longWork: bc.longWork,
-                                longProbPct: bc.longProbPct
-                            ) { w in m.withLock { $0.update(iterations: w) } }
-                        }
-                    }
-                }
-                benchmark.stopMeasurement()
-            }
-        }
-        #endif
     }
 
+    // Sleep-inside-lock.
     for sc in sleepHoldConfigs {
         let sleepSec = Double(sc.holdUs) / 1_000_000.0
-
-        Benchmark("\(sc.label) Synchronization.Mutex") { benchmark in
-            let box = SyncMutexBox(capacity: defaultMapCapacity)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: sc.tasks, acquiresPerTask: sc.acquiresPerTask) {
-                box.m.withLock { _ in Thread.sleep(forTimeInterval: sleepSec) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(sc.label) NIOLockedValueBox") { benchmark in
-            let box = NIOLockBox(capacity: defaultMapCapacity)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: sc.tasks, acquiresPerTask: sc.acquiresPerTask) {
-                box.box.withLockedValue { _ in Thread.sleep(forTimeInterval: sleepSec) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        #if os(Linux)
-        if runCopy {
-            Benchmark("\(sc.label) Synchronization.Mutex (copy)") { benchmark in
-                let m = SynchronizationMutex(MapState(capacity: defaultMapCapacity))
+        for v in variants {
+            Benchmark("\(sc.label) \(v.name)") { benchmark in
+                let h = v.make(defaultMapCapacity)
                 benchmark.startMeasurement()
                 await runWorkload(tasks: sc.tasks, acquiresPerTask: sc.acquiresPerTask) {
-                    m.withLock { _ in Thread.sleep(forTimeInterval: sleepSec) }
+                    h.runLocked { _ in Thread.sleep(forTimeInterval: sleepSec) }
                 }
                 benchmark.stopMeasurement()
             }
         }
-
-        Benchmark("\(sc.label) PlainFutexMutex (spin=100)") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: defaultMapCapacity), spinTries: 100)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: sc.tasks, acquiresPerTask: sc.acquiresPerTask) {
-                m.withLock { _ in Thread.sleep(forTimeInterval: sleepSec) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(sc.label) plain spin=14 backoff") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: defaultMapCapacity), spinTries: 14, useBackoff: true)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: sc.tasks, acquiresPerTask: sc.acquiresPerTask) {
-                m.withLock { _ in Thread.sleep(forTimeInterval: sleepSec) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(sc.label) plain spin=40 fixed") { benchmark in
-            let m = PlainFutexMutex(MapState(capacity: defaultMapCapacity), spinTries: 40)
-            benchmark.startMeasurement()
-            await runWorkload(tasks: sc.tasks, acquiresPerTask: sc.acquiresPerTask) {
-                m.withLock { _ in Thread.sleep(forTimeInterval: sleepSec) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        Benchmark("\(sc.label) Optimal") { benchmark in
-            let m = OptimalMutex(MapState(capacity: defaultMapCapacity))
-            benchmark.startMeasurement()
-            await runWorkload(tasks: sc.tasks, acquiresPerTask: sc.acquiresPerTask) {
-                m.withLock { _ in Thread.sleep(forTimeInterval: sleepSec) }
-            }
-            benchmark.stopMeasurement()
-        }
-
-        if runSlow {
-            Benchmark("\(sc.label) pthread_adaptive_np") { benchmark in
-                let m = AdaptiveMutex(MapState(capacity: defaultMapCapacity))
-                benchmark.startMeasurement()
-                await runWorkload(tasks: sc.tasks, acquiresPerTask: sc.acquiresPerTask) {
-                    m.withLock { _ in Thread.sleep(forTimeInterval: sleepSec) }
-                }
-                benchmark.stopMeasurement()
-            }
-        }
-        #endif
     }
 }

@@ -14,6 +14,7 @@ public enum BenchEnv {
     public static let slow       = flag("MUTEX_BENCH_SLOW")
     public static let copy       = flag("MUTEX_BENCH_COPY")
     public static let experiment = flag("MUTEX_BENCH_EXPERIMENT")
+    public static let instrument = flag("MUTEX_BENCH_INSTRUMENT")
     public static let rustDemote = flag("MUTEX_BENCH_RUST_DEMOTE")
 
     /// MUTEX_BENCH_MAX_SECS overrides; otherwise use per-target default.
